@@ -9,6 +9,11 @@
 #include "time.h"
 #include <esp_task_wdt.h> 
 
+// --- OTA Libraries ---
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
 // --- Modbus Libraries ---
 #include <ModbusMaster.h> // RS485 Master
 #include <ModbusTCP.h>    // TCP Server
@@ -40,10 +45,12 @@ Adafruit_NeoPixel pixels(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // --- Device Info (Dynamic) ---
 String sensor_model = "Wilcoxon 883M"; 
-String sensor_serial = "Unknown";
-String sensor_vendor_url = "Unknown"; 
+String sensor_serial = "Unknown";     // Holds Part Number (Obj 0x01)
+String sensor_vendor_url = "Unknown"; // Holds Vendor URL (Obj 0x03)
+String sensor_uuid = "Unknown";       // NEW: Holds Device UUID (Obj 0x04)
+String sensor_part_number = "Unknown"; // (Redundant if mapped to serial, but kept for safety)
 String sensor_fw_version = "Unknown";
-const char* FIRMWARE_VERSION = "3.8.0 - GitHub Release";
+const char* FIRMWARE_VERSION = "3.11.0 - Added UUID";
 
 // --- NTP & Time Config ---
 const char* ntpServer = "pool.ntp.org";
@@ -84,15 +91,18 @@ ModbusMaster node;
 bool modbusTcpEnabled = true;
 uint16_t modbusTcpPort = 502;
 ModbusTCP modbusTCPServer;
-#define MODBUS_TCP_CACHE_SIZE 80
-#define MODBUS_TCP_WINDOW_SIZE 125 
-#define HREG_DATA_TYPE_SELECT 80
-#define HREG_DATA_PAGE_INDEX  81 
-#define HREG_DATA_WINDOW_START 100 
+
+// --- LINEAR MODBUS MAP (Free Access) ---
+#define HREG_DATA_TYPE_SELECT 80      // Kept for legacy compatibility
 #define HREG_WAVEFORM_READY_STATUS 90
 #define HREG_SPECTRUM_READY_STATUS 91
+#define HREG_PLC_TRIGGER_CMD       95 // NEW: Write 1 here to trigger capture
 
-// --- Modbus Addresses ---
+// START ADDRESSES FOR FULL ARRAYS
+#define HREG_WAVEFORM_START 1000      // Registers 1000 - 14333 (13334 points)
+#define HREG_SPECTRUM_START 20000     // Registers 20000 - 26144 (6145 points)
+
+// --- Modbus Addresses (Sensor Side) ---
 #define REG_TRIGGER             0x0200 
 #define VAL_TRIGGER_START       0xFFFF 
 #define VAL_STATUS_READY        0x0000 
@@ -208,18 +218,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void publishAlert(String alertType, String details); void logMetrics();
 void handleGetMetricsLogData(); void handleMetricsLogControl(); void handleDownloadMetricsCsv();
 void handleClearMetricsLog(); void handleClearDynamicData(); void handleReboot();
-void handleDeviceInfo(); void handleModbusTcpSettings(); void handleSaveModbusTcp();
+void handleDeviceInfo(); void handleDeviceInfoJson(); // Added Prototype
+void handleModbusTcpSettings(); void handleSaveModbusTcp();
 void handleSetMetricsInterval(); 
 void handleTimeSettings(); void handleSaveTimeSettings(); void handleSetManualTime();
 String formatUptime(unsigned long ms);
 void publishProgressUpdate(const char* progress_message);
 void handleMqttStatus();
 void updateModbusTCPCache();
-void updateModbusTCPDataWindow();
+void syncModbusRegisters();
 void logMessage(String msg);
 String getResetReasonString();
 void handleClearSystemLog();
 void readDeviceIdentification();
+void setupOTA();
 
 // =================================================================
 // --- UTILITY FUNCTIONS
@@ -265,7 +277,7 @@ String getResetReasonString() {
         case ESP_RST_SW: return "Software Reset";
         case ESP_RST_PANIC: return "Crash (Panic/Exception)";
         case ESP_RST_INT_WDT: return "Internal Watchdog";
-        case ESP_RST_TASK_WDT: return "Task Watchdog";
+        case ESP_RST_TASK_WDT: return "Task WDT (Background Loop Stuck)";
         case ESP_RST_WDT: return "Other Watchdog";
         case ESP_RST_DEEPSLEEP: return "Deep Sleep Wake";
         case ESP_RST_BROWNOUT: return "Brownout";
@@ -337,7 +349,7 @@ std::vector<SpectrumPeak> findSpectrumPeaks(const int16_t* spectrum_buffer, int 
 }
 
 // =================================================================
-// --- MODBUS IDENTITY FUNCTION (UPDATED FOR DUAL QUERY)
+// --- MODBUS IDENTITY FUNCTION
 // =================================================================
 void fetchSensorIdentity() {
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
@@ -375,29 +387,17 @@ void fetchSensorIdentity() {
         Serial1.write(request, 7);
         Serial1.flush(); 
 
-        // 4. Read Response (FIXED TIMING LOGIC)
+        // 4. WAIT (Simulate Python time.sleep(0.3))
+        delay(300); 
+
+        // 5. Read Buffer
         uint8_t buffer[256]; 
         int idx = 0;
-        unsigned long startTime = millis();
-        unsigned long lastByteTime = millis();
-        
-        // Wait up to 1000ms total for the transaction
-        while (millis() - startTime < 1000) { 
-            if (Serial1.available()) {
-                if (idx < 256) buffer[idx++] = Serial1.read();
-                lastByteTime = millis(); // Reset "silence" timer
-            } else {
-                // Only break if we have received a header (at least 5 bytes) 
-                // AND the line has been silent for >50ms (End of Frame)
-                if (idx > 5 && (millis() - lastByteTime > 50)) {
-                    break; 
-                }
-                delay(1);
-            }
+        while(Serial1.available() && idx < 256) {
+            buffer[idx++] = Serial1.read();
         }
 
-        // 5. Parse Response
-        // Header check: SlaveID + Func(2B) + MEI(0E) + ReadCode(Matches sent)
+        // 6. Parse Response
         if (idx > 8 && buffer[1] == 0x2B && buffer[2] == 0x0E && buffer[3] == currentCode) {
             int objCount = buffer[7]; // Number of objects returned
             int ptr = 8; // Start of first object
@@ -416,22 +416,23 @@ void fetchSensorIdentity() {
                 
                 // --- MAPPING LOGIC ---
                 // Found in Basic Query (0x01)
-                if (objId == 0x01) sensor_serial = objData;     // User identified this (ProductCode) as the Serial Number
-                if (objId == 0x02) sensor_fw_version = objData;  // MajorMinorRevision
+                if (objId == 0x01) sensor_serial = objData;     // Part Number -> Serial Field
+                if (objId == 0x02) sensor_fw_version = objData;  // Firmware Version
                 
                 // Found in Regular Query (0x02)
-                if (objId == 0x05) sensor_model = objData;       // ModelName
-                if (objId == 0x03) sensor_vendor_url = objData;  // VendorUrl (Replaces unknown UUID)
+                if (objId == 0x05) sensor_model = objData;       // Model Name
+                if (objId == 0x03) sensor_vendor_url = objData;  // Vendor URL
+                if (objId == 0x04) sensor_uuid = objData;        // NEW: Device UUID
                 
                 ptr += (2 + objLen); // Move to next object
             }
         } else {
              logMessage("[System] ID Query " + String(currentCode) + " failed. Bytes: " + String(idx));
         }
-        delay(100); // Increased pause between queries
+        delay(100); // Pause between queries
     }
     
-    logMessage("[System] ID Result -> Model: " + sensor_model + " | Serial: " + sensor_serial + " | Vendor: " + sensor_vendor_url);
+    logMessage("[System] ID Result -> Model: " + sensor_model + " | P/N: " + sensor_serial + " | UUID: " + sensor_uuid);
     xSemaphoreGive(dataMutex);
 }
 
@@ -442,8 +443,9 @@ void publishDeviceHealth() {
     if (!mqttClient || !mqttClient->connected()) return;
     DynamicJsonDocument doc(2048); 
     doc["model"] = sensor_model; 
-    doc["serial_number"] = sensor_serial; 
-    doc["vendor_url"] = sensor_vendor_url; // Added
+    doc["serial_number"] = sensor_serial; // Part Number
+    doc["device_uuid"] = sensor_uuid;     // NEW: Actual UUID
+    doc["vendor_url"] = sensor_vendor_url; 
     doc["timestamp"] = getTimestamp();
     doc["type"] = "health_status";
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -463,7 +465,7 @@ void publishMetrics() {
     DynamicJsonDocument doc(4096); 
     doc["model"] = sensor_model;
     doc["serial_number"] = sensor_serial;
-    doc["vendor_url"] = sensor_vendor_url; // Added
+    doc["vendor_url"] = sensor_vendor_url; 
     doc["timestamp"] = getTimestamp();
     doc["type"] = "metrics";
     JsonObject data = doc.createNestedObject("data");
@@ -703,26 +705,46 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // Note: Checking against global variable which is updated at runtime
     const char* target_sn = doc["serial_number"];
 
-    if (target_sn && String(target_sn) == sensor_serial) {
+    // Accept if SN matches OR if message has no SN (generic broadcast to this topic)
+    if (!target_sn || String(target_sn) == sensor_serial) {
         const char* command = doc["command"];
         if (command) {
             logMessage("MQTT Command received: " + String(command));
+            
             if (strcmp(command, "get_metrics") == 0) {
                 publishMetrics();
                 return;
             }
+            
             if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                if (strcmp(command, "trigger_capture") == 0) {
+                // --- COMMAND: TRIGGER_ALL (Collects X, Y, Z sequentially) ---
+                if (strcmp(command, "trigger_all") == 0) {
+                    requestedAxis = AXIS_X;             // Start with X
+                    requestedCapture = CAPTURE_BOTH;    // Get Wave + Spectrum
+                    currentDataState = DD_REQUEST_DATA; // Start Machine
+                    
+                    isAutoCaptureCycleActive = true;    // Enable auto-switching to Y and Z
+                    autoCaptureAxisIndex = 0;           // Reset cycle counter
+                    xyzPeakDataCache.clear();           // Clear cache
+                    
+                    logMessage("MQTT: Starting Full XYZ Capture Sequence");
+                }
+                // --- COMMAND: TRIGGER_CAPTURE (Single Axis) ---
+                else if (strcmp(command, "trigger_capture") == 0) {
                     String axis = doc["axis"] | "X";
                     if(axis == "X") requestedAxis = AXIS_X;
                     else if(axis == "Y") requestedAxis = AXIS_Y;
                     else if(axis == "Z") requestedAxis = AXIS_Z;
+                    
                     if(requestedAxis != AXIS_NONE) {
                         requestedCapture = CAPTURE_BOTH;
                         currentDataState = DD_REQUEST_DATA;
-                        logMessage("MQTT trigger for Axis " + axis);
+                        isAutoCaptureCycleActive = false; // Do NOT cycle, just one axis
+                        logMessage("MQTT: Triggering Single Axis " + axis);
                     }
-                } else if (strcmp(command, "set_interval") == 0) {
+                } 
+                // --- COMMAND: SET INTERVAL ---
+                else if (strcmp(command, "set_interval") == 0) {
                     long newInterval = doc["interval_ms"];
                     if (newInterval > 0) {
                         dataCaptureInterval = newInterval;
@@ -990,7 +1012,7 @@ void handleLongReads() {
 }
 
 // =================================================================
-// --- MODBUS TCP HELPERS
+// --- MODBUS TCP HELPERS (LINEAR MAPPING)
 // =================================================================
 void updateModbusTCPCache() {
     if (!modbusTcpEnabled) return;
@@ -1060,47 +1082,80 @@ void updateModbusTCPCache() {
     }
 }
 
-void updateModbusTCPDataWindow() {
+// --- UPDATED: COPY FULL BUFFERS TO MODBUS REGISTERS ---
+// This runs only when new data is available to keep the loop fast.
+void syncModbusRegisters() {
     if (!modbusTcpEnabled) return;
 
-    uint16_t dataType = modbusTCPServer.Hreg(HREG_DATA_TYPE_SELECT);
-    uint16_t pageIndex = modbusTCPServer.Hreg(HREG_DATA_PAGE_INDEX);
-    
-    uint16_t startDataIndex = pageIndex * MODBUS_TCP_WINDOW_SIZE;
-    uint16_t totalPoints = 0;
-    int16_t val = 0;
-
-    if (dataType == 1) {
-        totalPoints = WAVEFORM_TOTAL_POINTS;
-    } else if (dataType == 2) {
-        totalPoints = SPECTRUM_TOTAL_POINTS;
-    } else {
-        for (int i = 0; i < MODBUS_TCP_WINDOW_SIZE; i++) {
-            modbusTCPServer.Hreg(HREG_DATA_WINDOW_START + i, 0);
-        }
-        return;
-    }
-
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        for (int i = 0; i < MODBUS_TCP_WINDOW_SIZE; i++) {
-            uint16_t currentIndex = startDataIndex + i;
-            if (currentIndex < totalPoints) {
-                if (dataType == 1) val = fullWaveform[currentIndex];
-                else val = spectrumData[currentIndex];
-            } else {
-                val = 0; 
+    // Use a mutex check to ensure we don't read while writing
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        
+        // 1. Sync Waveform if available
+        // Note: Writing 13,000 registers takes a few milliseconds but is safe on ESP32-S3
+        if (newWaveformAvailable) {
+            for (int i = 0; i < WAVEFORM_TOTAL_POINTS; i++) {
+                modbusTCPServer.Hreg(HREG_WAVEFORM_START + i, fullWaveform[i]);
             }
-            modbusTCPServer.Hreg(HREG_DATA_WINDOW_START + i, val);
         }
+
+        // 2. Sync Spectrum if available
+        if (newSpectrumAvailable) {
+            for (int i = 0; i < SPECTRUM_TOTAL_POINTS; i++) {
+                modbusTCPServer.Hreg(HREG_SPECTRUM_START + i, spectrumData[i]);
+            }
+        }
+
         xSemaphoreGive(dataMutex);
     }
+}
+
+// =================================================================
+// --- OTA CONFIGURATION
+// =================================================================
+void setupOTA() {
+  ArduinoOTA.setHostname("ILA-Gateway-883M");
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
+    else type = "filesystem";
+    // Unmount filesystem if necessary
+    logMessage("Start updating " + type);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    logMessage("\nEnd");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    // Optional: Print progress to Serial if connected
+    // Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    String err = "Error[" + String(error) + "]: ";
+    if (error == OTA_AUTH_ERROR) err += "Auth Failed";
+    else if (error == OTA_BEGIN_ERROR) err += "Begin Failed";
+    else if (error == OTA_CONNECT_ERROR) err += "Connect Failed";
+    else if (error == OTA_RECEIVE_ERROR) err += "Receive Failed";
+    else if (error == OTA_END_ERROR) err += "End Failed";
+    logMessage(err);
+  });
+
+  ArduinoOTA.begin();
+  logMessage("OTA Service Started");
 }
 
 // =================================================================
 // --- RTOS TASKS ---
 // =================================================================
 void webServerLoop(void * pvParameters) {
-    for(;;) { server.handleClient(); vTaskDelay(2); }
+    // OTA Handle must run in a loop with network access
+    for(;;) { 
+        server.handleClient(); 
+        ArduinoOTA.handle(); // Check for OTA updates
+        vTaskDelay(2); 
+    }
 }
 
 void backgroundLoop(void * pvParameters) {
@@ -1173,13 +1228,20 @@ void backgroundLoop(void * pvParameters) {
                     
                     esp_task_wdt_reset(); 
 
-                    if (mqttClient->connect("esp32-ila-sensor", mqtt_user_str.c_str(), mqtt_pass_str.c_str())) {
+                    // --- UPDATED: MQTT Connect with Last Will & Testament (LWT) ---
+                    // If device dies, Broker publishes "offline" to status topic automatically
+                    String lwtPayload = "{\"status\":\"offline\",\"reason\":\"unexpected_disconnect\"}";
+                    
+                    if (mqttClient->connect("esp32-ila-sensor", mqtt_user_str.c_str(), mqtt_pass_str.c_str(), 
+                                           mqtt_status_topic.c_str(), 1, true, lwtPayload.c_str())) {
+                                           
                          logMessage("[MQTT] Connected to " + mqtt_server_str);
                          if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             snprintf(mqttStatus, sizeof(mqttStatus), "Connected");
                             xSemaphoreGive(dataMutex);
                          }
                         mqttClient->subscribe(mqtt_command_topic.c_str());
+                        publishDeviceHealth(); // Announce online immediately
                     } else {
                          logMessage("[MQTT] Connect Failed rc=" + String(mqttClient->state()));
                     }
@@ -1194,10 +1256,39 @@ void backgroundLoop(void * pvParameters) {
             }
         }
 
-        if (modbusTcpEnabled) { modbusTCPServer.task(); }
+        if (modbusTcpEnabled) { 
+            modbusTCPServer.task(); 
+            
+            // --- NEW: PLC Remote Trigger Check (Register 95) ---
+            if (modbusTCPServer.Hreg(HREG_PLC_TRIGGER_CMD) == 1) {
+                logMessage("Modbus TCP: Trigger received from PLC/SCADA");
+                
+                // Reset register immediately to prevent loop triggering
+                modbusTCPServer.Hreg(HREG_PLC_TRIGGER_CMD, 0); 
+                
+                // Initiate Capture Sequence (X-Axis Start)
+                if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    requestedAxis = AXIS_X;
+                    requestedCapture = CAPTURE_BOTH;
+                    currentDataState = DD_REQUEST_DATA;
+                    
+                    isAutoCaptureCycleActive = true; 
+                    autoCaptureAxisIndex = 0;
+                    xyzPeakDataCache.clear();
+                    xSemaphoreGive(dataMutex);
+                }
+            }
+        }
         updateLedStatus();
         
         handleLongReads(); // Handles the actual Modbus reading state machine
+
+        // Sync Modbus TCP registers if new data arrived
+        static unsigned long lastModbusSync = 0;
+        if (millis() - lastModbusSync > 1000) { // Update registers every second if needed
+             syncModbusRegisters();
+             lastModbusSync = millis();
+        }
 
         bool local_isReadingWaveform, local_isReadingSpectrum;
         if(xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -1276,7 +1367,7 @@ void backgroundLoop(void * pvParameters) {
                         
                         if(mqttClient && mqttClient->connected()) { publishMetrics(); }
                         if(local_isMetricsRecording) { logMetrics(); }
-                        if (modbusTcpEnabled) { updateModbusTCPCache(); updateModbusTCPDataWindow(); }
+                        if (modbusTcpEnabled) { updateModbusTCPCache(); syncModbusRegisters(); } // Use syncModbusRegisters
                     } else {
                         snprintf(systemStatus, sizeof(systemStatus), "Error reading metrics");
                         logMessage("Error reading metrics from sensor.");
@@ -1398,6 +1489,15 @@ void setup() {
     pixels.show();
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
+    
+    // --- NEW: Boot/Reset Beep Sequence ---
+    tone(BUZZER_PIN, 2000, 100); 
+    delay(150);
+    tone(BUZZER_PIN, 2500, 200); 
+    delay(200);
+    noTone(BUZZER_PIN);
+    // -------------------------------------
+
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     logMessage("--- System Starting ---");
@@ -1460,6 +1560,9 @@ void setup() {
 
     wasWifiConnected = (WiFi.status() == WL_CONNECTED);
 
+    // 5.1 Initialize OTA
+    setupOTA();
+
     // 6. Init Modbus
     Serial1.begin(modbus_baud_rate_val, SERIAL_8N1, RXD_PIN, TXD_PIN);
     node.begin(modbus_slave_id_val, Serial1);
@@ -1470,11 +1573,18 @@ void setup() {
 
     if (connected_to_wifi && modbusTcpEnabled) {
       modbusTCPServer.server(modbusTcpPort);
-      modbusTCPServer.addHreg(0, 0, MODBUS_TCP_CACHE_SIZE);
-      modbusTCPServer.addHreg(HREG_DATA_TYPE_SELECT, 0, 2); 
-      modbusTCPServer.addHreg(HREG_WAVEFORM_READY_STATUS, 0, 2); 
-      modbusTCPServer.addHreg(HREG_DATA_WINDOW_START, 0, MODBUS_TCP_WINDOW_SIZE);
-      logMessage("Modbus TCP Server Started on port " + String(modbusTcpPort));
+      
+      // 1. Add Live Metrics Registers (0-100)
+      modbusTCPServer.addHreg(0, 0, 100); 
+
+      // 2. Add Full Waveform Block (1000 - 14334)
+      // This allocates memory for the full waveform map
+      modbusTCPServer.addHreg(HREG_WAVEFORM_START, 0, WAVEFORM_TOTAL_POINTS);
+
+      // 3. Add Full Spectrum Block (20000 - 26145)
+      modbusTCPServer.addHreg(HREG_SPECTRUM_START, 0, SPECTRUM_TOTAL_POINTS);
+
+      logMessage("Modbus TCP: Map 1000->Waveform, 20000->Spectrum");
     }
     
     // 7. Setup Web Server
@@ -1501,6 +1611,7 @@ void setup() {
     server.on("/clear_dynamic_data", HTTP_GET, handleClearDynamicData);
     server.on("/reboot", HTTP_GET, handleReboot);
     server.on("/device_info", HTTP_GET, handleDeviceInfo);
+    server.on("/device_info_json", HTTP_GET, handleDeviceInfoJson); // NEW Route
     server.on("/modbustcp_settings", HTTP_GET, handleModbusTcpSettings);
     server.on("/save_modbustcp", HTTP_GET, handleSaveModbusTcp);
     server.on("/mqtt_status", HTTP_GET, handleMqttStatus); 
@@ -2228,7 +2339,7 @@ String html = R"rawliteral(
     </script>
 </body>
 </html>)rawliteral";
-    server.send(200, "text/html; charset=utf-8", html);
+    server.send(200, "text/html", html);
 }
 
 void handleMetrics() {
@@ -2720,170 +2831,245 @@ void handleClearDynamicData() {
 }
 
 void handleModbusTcpSettings() {
+    String ipAddress = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    
     String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Modbus TCP Address Map | Wilcoxon 883M</title>
+    <title>Modbus TCP Server</title>
     <style>
-        :root { --primary: #0056b3; --secondary: #6c757d; --bg: #f8f9fa; --border: #dee2e6; --success-bg: #d4edda; --success-text: #155724; }
+        :root { --primary: #0056b3; --secondary: #6c757d; --bg: #f8f9fa; --border: #dee2e6; --green: #28a745; --red: #dc3545; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
-        h1 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid var(--border); padding-bottom: 15px; }
-        .card { background: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 5px solid var(--primary); }
-        .calculator { background: #fff; border: 1px solid var(--border); padding: 20px; border-radius: 8px; display: flex; gap: 15px; align-items: flex-end; flex-wrap: wrap; box-shadow: 0 2px 10px rgba(0,0,0,0.03); }
-        .input-group { display: flex; flex-direction: column; gap: 5px; flex-grow: 1; }
-        .input-group label { font-size: 0.9rem; font-weight: 600; color: #555; }
-        .input-group input, .input-group select { padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; }
-        button { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 1rem; transition: background 0.2s; }
-        #calc-result { margin-top: 15px; padding: 15px; background: var(--success-bg); border: 1px solid #c3e6cb; color: var(--success-text); border-radius: 6px; display: none; }
-        .tabs { display: flex; border-bottom: 2px solid var(--border); margin-top: 30px; }
-        .tab { padding: 12px 25px; cursor: pointer; font-weight: 600; color: var(--secondary); border-bottom: 3px solid transparent; transition: all 0.2s; }
-        .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
-        .tab-content { display: none; padding-top: 20px; }
-        .tab-content.active { display: block; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
-        th, td { border: 1px solid var(--border); padding: 10px 12px; text-align: left; }
-        th { background-color: #f1f3f5; font-weight: 700; color: #495057; position: sticky; top: 0; }
-        .addr-badge { background: #495057; color: white; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
-        .live-val { font-family: monospace; font-weight: bold; color: #007bff; }
-        .switch{position:relative;display:inline-block;width:50px;height:28px}.switch input{opacity:0;width:0;height:0}
-        .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:28px}
-        .slider:before{position:absolute;content:"";height:20px;width:20px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%}
-        input:checked+.slider{background-color:#28a745} input:checked+.slider:before{transform:translateX(22px)}
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
+        h1 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid var(--border); padding-bottom: 15px; display: flex; justify-content: space-between; align-items: center; }
+        .config-box { background: #e9ecef; padding: 20px; border-radius: 8px; margin-bottom: 30px; border-left: 5px solid var(--primary); }
+        .form-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
+        .info-row { display: flex; gap: 20px; margin-bottom: 20px; font-family: monospace; font-size: 1.1em; background: #fff; padding: 10px; border-radius: 6px; }
+        label { font-weight: 600; color: #495057; }
+        input[type=number] { padding: 8px; border-radius: 4px; border: 1px solid #ced4da; width: 80px; }
+        button { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #004494; }
+        
+        /* Toggle Switch */
+        .switch { position: relative; display: inline-block; width: 50px; height: 26px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: var(--green); }
+        input:checked + .slider:before { transform: translateX(24px); }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85em; }
+        th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+        th { background-color: #f1f3f5; font-weight: 700; position: sticky; top: 0; }
+        .addr-badge { background: #495057; color: white; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 1.1em; }
+        .live-val { font-family: monospace; font-weight: bold; color: var(--primary); font-size: 1.1em; }
+        .badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.8em; font-weight: bold; }
+        .bg-green { background-color: var(--green); }
+        .bg-blue { background-color: #17a2b8; }
+        .axis-header { background-color: #e2e6ea; font-weight: bold; text-align: center; font-size: 1.1em; padding: 8px; }
+        .source-map { font-size: 0.9em; color: #555; margin-top: 5px; line-height: 1.5; border-top: 1px dashed #ccc; padding-top: 4px; }
+        .source-map strong { color: #333; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>Modbus TCP Settings & Map</h1>
-    <div style="background:#f8f9fa; padding:20px; border-radius:8px; margin-bottom:30px; border:1px solid #dee2e6;">
-        <h3 style="margin-top:0">Server Configuration</h3>
+    <h1>Modbus TCP Server</h1>
+    
+    <div class="config-box">
+        <div class="info-row">
+            <span><strong>IP Address:</strong> <span style="color:var(--primary)">)rawliteral" + ipAddress + R"rawliteral(</span></span>
+            <span><strong>Status:</strong> <span id="server-status" style="font-weight:bold;">)rawliteral" + String(modbusTcpEnabled ? "RUNNING" : "STOPPED") + R"rawliteral(</span></span>
+        </div>
+        
         <form onsubmit="return saveSettings()">
-            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:15px;">
-                <label style="font-weight:600">Enable Modbus TCP Server</label>
+            <div class="form-row">
+                <label for="enabled">Enable Server</label>
                 <label class="switch"><input type="checkbox" id="enabled" name="enabled"><span class="slider"></span></label>
             </div>
-            <div class="input-group">
-                <label for="port">Server Port</label>
+            <div class="form-row">
+                <label for="port">Port (Default: 502)</label>
                 <input type="number" id="port" name="port" min="1" max="65535" required>
             </div>
-            <button type="submit" style="width:100%; margin-top:15px;">Save and Reboot</button>
+            <button type="submit">Save Configuration & Reboot</button>
         </form>
     </div>
 
-    <div class="card"><strong>Quick Lookup:</strong> Calculate Page Index for Waveform data.</div>
-    <div class="calculator">
-        <div class="input-group"><label>Data Type</label><select id="calc-type"><option value="1">Waveform</option><option value="2">Spectrum</option></select></div>
-        <div class="input-group"><label>Data Point Index</label><input type="number" id="calc-index" placeholder="e.g. 5000" min="0"></div>
-        <button onclick="calculateAddress()">Find Address</button>
-    </div>
-    <div id="calc-result"></div>
+    <h3>1. Live Metrics Map (Read Only)</h3>
+    <p style="font-size:0.9em; color:#666;">These registers update in real-time based on the sensor poll rate.</p>
+    <table>
+        <thead><tr><th>Address</th><th>Metric Name</th><th>Unit</th><th>Live Value</th></tr></thead>
+        <tbody id="live-table-body"></tbody>
+    </table>
 
-    <div class="tabs">
-        <div class="tab active" onclick="switchTab('live')">Live Registers (0-60)</div>
-        <div class="tab" onclick="switchTab('waveform')">Waveform Pages</div>
-        <div class="tab" onclick="switchTab('spectrum')">Spectrum Pages</div>
-    </div>
+    <h3 style="margin-top:40px;">2. High-Speed Linear Map (Read Only)</h3>
+    <p style="font-size:0.9em; color:#666;">Read these large blocks directly. The data corresponds to the <strong>Last Captured Axis</strong> (X, Y, or Z).</p>
+    <table>
+        <thead><tr><th>Gateway Range</th><th>Size</th><th>Content & Sensor Source Address</th><th>Format</th></tr></thead>
+        <tbody>
+            <tr>
+                <td><span class="addr-badge">1000 - 14333</span></td>
+                <td>13,334</td>
+                <td>
+                    <strong>Time Waveform</strong> (Latest Capture)<br>
+                    <div class="source-map">
+                        <strong>Data Source (Sensor Addr):</strong><br>
+                        X-Axis: 0x1E01 - 0x5216<br>
+                        Y-Axis: 0x7101 - 0xA516<br>
+                        Z-Axis: 0xC401 - 0xF816
+                    </div>
+                </td>
+                <td>Signed Int16<br>(x 0.001 g)</td>
+            </tr>
+            <tr>
+                <td><span class="addr-badge">20000 - 26144</span></td>
+                <td>6,145</td>
+                <td>
+                    <strong>FFT Spectrum</strong> (Latest Capture)<br>
+                    <div class="source-map">
+                        <strong>Data Source (Sensor Addr):</strong><br>
+                        X-Axis: 0x0600 - 0x1E00<br>
+                        Y-Axis: 0x5900 - 0x7100<br>
+                        Z-Axis: 0xAC00 - 0xC400
+                    </div>
+                </td>
+                <td>Unsigned Int16<br>(x 0.001 g)</td>
+            </tr>
+        </tbody>
+    </table>
 
-    <div id="live" class="tab-content active">
-        <table><thead><tr><th>Address</th><th>Metric</th><th>Unit</th><th>Value</th></tr></thead><tbody id="live-table-body"></tbody></table>
-    </div>
-    <div id="waveform" class="tab-content">
-        <p><strong>Set Reg 80 to 1.</strong> Window: 125 registers (Addr 100-224).</p>
-        <table><thead><tr><th>Page (Reg 81)</th><th>Address Range</th><th>Index Range</th><th>Count</th></tr></thead><tbody id="wf-table-body"></tbody></table>
-    </div>
-    <div id="spectrum" class="tab-content">
-        <p><strong>Set Reg 80 to 2.</strong> Window: 125 registers (Addr 100-224).</p>
-        <table><thead><tr><th>Page (Reg 81)</th><th>Address Range</th><th>Index Range</th><th>Count</th></tr></thead><tbody id="sp-table-body"></tbody></table>
-    </div>
-
-    <div style="margin-top:20px; text-align:center;">
+    <div style="margin-top:30px; text-align:center;">
         <a href="/settings" style="display:inline-block; padding:10px 20px; background:#6c757d; color:white; text-decoration:none; border-radius:6px; font-weight:600;">&larr; Back to Settings</a>
     </div>
 </div>
 
 <script>
-    const WF_TOTAL=13334, SP_TOTAL=6145, WINDOW_SIZE=125, WINDOW_START=100;
     const liveRegisters=[
-        {addr:0,name:"X Accel RMS",unit:"g",scale:100.0,key:"accelRms",axis:"x"},{addr:1,name:"X Accel Peak",unit:"g",scale:100.0,key:"accelPeak",axis:"x"},
-        {addr:2,name:"X Accel RMS (10-5k)",unit:"g",scale:100.0,key:"accelRms2",axis:"x"},{addr:3,name:"X Accel Peak (10-5k)",unit:"g",scale:100.0,key:"accelPeak2",axis:"x"},
-        {addr:4,name:"X Velo RMS",unit:"mm/s",scale:10.0,key:"veloRms",axis:"x"},{addr:5,name:"X Velo Peak",unit:"mm/s",scale:10.0,key:"veloPeak",axis:"x"},
-        {addr:6,name:"X Displ RMS",unit:"um",scale:1.0,key:"displRms",axis:"x"},{addr:7,name:"X Displ Peak",unit:"um",scale:1.0,key:"displPeak",axis:"x"},
-        {addr:8,name:"X True Peak",unit:"g",scale:100.0,key:"truePeak",axis:"x"},{addr:9,name:"X Crest Factor",unit:"",scale:100.0,key:"crestFactor",axis:"x"},
-        {addr:10,name:"X AccelMetric RMS",unit:"m/s²",scale:10.0,key:"accelMetricRms",axis:"x"},{addr:11,name:"X AccelMetric Peak",unit:"m/s²",scale:10.0,key:"accelMetricPeak",axis:"x"},
-        {addr:12,name:"X AccelMetric RMS (10-5k)",unit:"m/s²",scale:10.0,key:"accelMetricRms2",axis:"x"},{addr:13,name:"X AccelMetric Peak (10-5k)",unit:"m/s²",scale:10.0,key:"accelMetricPeak2",axis:"x"},
-        {addr:14,name:"X VeloWide RMS",unit:"mm/s",scale:10.0,key:"veloWideRms",axis:"x"},{addr:15,name:"X VeloWide Peak",unit:"mm/s",scale:10.0,key:"veloWidePeak",axis:"x"},
-        {addr:16,name:"X DisplLow RMS",unit:"um",scale:1.0,key:"displLowRms",axis:"x"},{addr:17,name:"X DisplLow Peak",unit:"um",scale:1.0,key:"displLowPeak",axis:"x"},
+        // X-Axis
+        {addr:0,name:"X Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"x"}, 
+        {addr:1,name:"X Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"x"},
+        {addr:2,name:"X Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"x"}, 
+        {addr:3,name:"X Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"x"},
+        {addr:4,name:"X Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"x"}, 
+        {addr:5,name:"X Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"x"},
+        {addr:6,name:"X Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"x"}, 
+        {addr:7,name:"X Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"x"},
+        {addr:8,name:"X True Peak",unit:"g",key:"truePeak",axis:"x"}, 
+        {addr:9,name:"X Crest Factor",unit:"-",key:"crestFactor",axis:"x"},
+        {addr:10,name:"X Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"x"},
+        {addr:11,name:"X Accel Metric Peak",unit:"m/s²",key:"accelMetricPeak",axis:"x"},
+        {addr:12,name:"X Accel Metric RMS2",unit:"m/s²",key:"accelMetricRms2",axis:"x"},
+        {addr:13,name:"X Accel Metric Peak2",unit:"m/s²",key:"accelMetricPeak2",axis:"x"},
+        {addr:14,name:"X Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"x"},
+        {addr:15,name:"X Vel Wide Peak",unit:"mm/s",key:"veloWidePeak",axis:"x"},
+        {addr:16,name:"X Disp Low RMS",unit:"um",key:"displLowRms",axis:"x"},
+        {addr:17,name:"X Disp Low Peak",unit:"um",key:"displLowPeak",axis:"x"},
 
-        {addr:20,name:"Y Accel RMS",unit:"g",scale:100.0,key:"accelRms",axis:"y"},{addr:21,name:"Y Accel Peak",unit:"g",scale:100.0,key:"accelPeak",axis:"y"},
-        {addr:22,name:"Y Accel RMS (10-5k)",unit:"g",scale:100.0,key:"accelRms2",axis:"y"},{addr:23,name:"Y Accel Peak (10-5k)",unit:"g",scale:100.0,key:"accelPeak2",axis:"y"},
-        {addr:24,name:"Y Velo RMS",unit:"mm/s",scale:10.0,key:"veloRms",axis:"y"},{addr:25,name:"Y Velo Peak",unit:"mm/s",scale:10.0,key:"veloPeak",axis:"y"},
-        {addr:26,name:"Y Displ RMS",unit:"um",scale:1.0,key:"displRms",axis:"y"},{addr:27,name:"Y Displ Peak",unit:"um",scale:1.0,key:"displPeak",axis:"y"},
-        {addr:28,name:"Y True Peak",unit:"g",scale:100.0,key:"truePeak",axis:"y"},{addr:29,name:"Y Crest Factor",unit:"",scale:100.0,key:"crestFactor",axis:"y"},
-        {addr:30,name:"Y AccelMetric RMS",unit:"m/s²",scale:10.0,key:"accelMetricRms",axis:"y"},{addr:31,name:"Y AccelMetric Peak",unit:"m/s²",scale:10.0,key:"accelMetricPeak",axis:"y"},
-        {addr:32,name:"Y AccelMetric RMS (10-5k)",unit:"m/s²",scale:10.0,key:"accelMetricRms2",axis:"y"},{addr:33,name:"Y AccelMetric Peak (10-5k)",unit:"m/s²",scale:10.0,key:"accelMetricPeak2",axis:"y"},
-        {addr:34,name:"Y VeloWide RMS",unit:"mm/s",scale:10.0,key:"veloWideRms",axis:"y"},{addr:35,name:"Y VeloWide Peak",unit:"mm/s",scale:10.0,key:"veloWidePeak",axis:"y"},
-        {addr:36,name:"Y DisplLow RMS",unit:"um",scale:1.0,key:"displLowRms",axis:"y"},{addr:37,name:"Y DisplLow Peak",unit:"um",scale:1.0,key:"displLowPeak",axis:"y"},
+        // Y-Axis
+        {addr:20,name:"Y Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"y"}, 
+        {addr:21,name:"Y Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"y"},
+        {addr:22,name:"Y Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"y"}, 
+        {addr:23,name:"Y Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"y"},
+        {addr:24,name:"Y Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"y"}, 
+        {addr:25,name:"Y Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"y"},
+        {addr:26,name:"Y Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"y"}, 
+        {addr:27,name:"Y Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"y"},
+        {addr:28,name:"Y True Peak",unit:"g",key:"truePeak",axis:"y"}, 
+        {addr:29,name:"Y Crest Factor",unit:"-",key:"crestFactor",axis:"y"},
+        {addr:30,name:"Y Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"y"},
+        {addr:31,name:"Y Accel Metric Peak",unit:"m/s²",key:"accelMetricPeak",axis:"y"},
+        {addr:32,name:"Y Accel Metric RMS2",unit:"m/s²",key:"accelMetricRms2",axis:"y"},
+        {addr:33,name:"Y Accel Metric Peak2",unit:"m/s²",key:"accelMetricPeak2",axis:"y"},
+        {addr:34,name:"Y Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"y"},
+        {addr:35,name:"Y Vel Wide Peak",unit:"mm/s",key:"veloWidePeak",axis:"y"},
+        {addr:36,name:"Y Disp Low RMS",unit:"um",key:"displLowRms",axis:"y"},
+        {addr:37,name:"Y Disp Low Peak",unit:"um",key:"displLowPeak",axis:"y"},
 
-        {addr:40,name:"Z Accel RMS",unit:"g",scale:100.0,key:"accelRms",axis:"z"},{addr:41,name:"Z Accel Peak",unit:"g",scale:100.0,key:"accelPeak",axis:"z"},
-        {addr:42,name:"Z Accel RMS (10-5k)",unit:"g",scale:100.0,key:"accelRms2",axis:"z"},{addr:43,name:"Z Accel Peak (10-5k)",unit:"g",scale:100.0,key:"accelPeak2",axis:"z"},
-        {addr:44,name:"Z Velo RMS",unit:"mm/s",scale:10.0,key:"veloRms",axis:"z"},{addr:45,name:"Z Velo Peak",unit:"mm/s",scale:10.0,key:"veloPeak",axis:"z"},
-        {addr:46,name:"Z Displ RMS",unit:"um",scale:1.0,key:"displRms",axis:"z"},{addr:47,name:"Z Displ Peak",unit:"um",scale:1.0,key:"displPeak",axis:"z"},
-        {addr:48,name:"Z True Peak",unit:"g",scale:100.0,key:"truePeak",axis:"z"},{addr:49,name:"Z Crest Factor",unit:"",scale:100.0,key:"crestFactor",axis:"z"},
-        {addr:50,name:"Z AccelMetric RMS",unit:"m/s²",scale:10.0,key:"accelMetricRms",axis:"z"},{addr:51,name:"Z AccelMetric Peak",unit:"m/s²",scale:10.0,key:"accelMetricPeak",axis:"z"},
-        {addr:52,name:"Z AccelMetric RMS (10-5k)",unit:"m/s²",scale:10.0,key:"accelMetricRms2",axis:"z"},{addr:53,name:"Z AccelMetric Peak (10-5k)",unit:"m/s²",scale:10.0,key:"accelMetricPeak2",axis:"z"},
-        {addr:54,name:"Z VeloWide RMS",unit:"mm/s",scale:10.0,key:"veloWideRms",axis:"z"},{addr:55,name:"Z VeloWide Peak",unit:"mm/s",scale:10.0,key:"veloWidePeak",axis:"z"},
-        {addr:56,name:"Z DisplLow RMS",unit:"um",scale:1.0,key:"displLowRms",axis:"z"},{addr:57,name:"Z DisplLow Peak",unit:"um",scale:1.0,key:"displLowPeak",axis:"z"},
+        // Z-Axis
+        {addr:40,name:"Z Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"z"}, 
+        {addr:41,name:"Z Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"z"},
+        {addr:42,name:"Z Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"z"}, 
+        {addr:43,name:"Z Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"z"},
+        {addr:44,name:"Z Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"z"}, 
+        {addr:45,name:"Z Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"z"},
+        {addr:46,name:"Z Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"z"}, 
+        {addr:47,name:"Z Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"z"},
+        {addr:48,name:"Z True Peak",unit:"g",key:"truePeak",axis:"z"}, 
+        {addr:49,name:"Z Crest Factor",unit:"-",key:"crestFactor",axis:"z"},
+        {addr:50,name:"Z Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"z"},
+        {addr:51,name:"Z Accel Metric Peak",unit:"m/s²",key:"accelMetricPeak",axis:"z"},
+        {addr:52,name:"Z Accel Metric RMS2",unit:"m/s²",key:"accelMetricRms2",axis:"z"},
+        {addr:53,name:"Z Accel Metric Peak2",unit:"m/s²",key:"accelMetricPeak2",axis:"z"},
+        {addr:54,name:"Z Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"z"},
+        {addr:55,name:"Z Vel Wide Peak",unit:"mm/s",key:"veloWidePeak",axis:"z"},
+        {addr:56,name:"Z Disp Low RMS",unit:"um",key:"displLowRms",axis:"z"},
+        {addr:57,name:"Z Disp Low Peak",unit:"um",key:"displLowPeak",axis:"z"},
         
-        {addr:60,name:"Temperature",unit:"C",scale:10.0,key:"temperature",axis:null}
+        // System
+        {addr:60,name:"Temperature",unit:"C",key:"temperature",axis:null},
+        {addr:90,name:"Waveform Ready",unit:"Bool",key:"newWaveformAvailable",axis:null},
+        {addr:91,name:"Spectrum Ready",unit:"Bool",key:"newSpectrumAvailable",axis:null},
+        {addr:95,name:"PLC Trigger Command",unit:"Write 1",key:"",axis:null}
     ];
 
-    function generateTable(total,id){
-        let h='', p=Math.ceil(total/WINDOW_SIZE);
-        for(let i=0;i<p;i++){
-            let s=i*WINDOW_SIZE, e=Math.min(s+WINDOW_SIZE-1,total-1), c=e-s+1;
-            h+=`<tr><td><span class="addr-badge">${i}</span></td><td>${WINDOW_START}-${WINDOW_START+c-1}</td><td>${s}-${e}</td><td>${c}</td></tr>`;
-        }
-        document.getElementById(id).innerHTML=h;
-    }
-    function generateLive(){
-        let h=''; liveRegisters.forEach(r=>{h+=`<tr><td><span class="addr-badge">${r.addr}</span></td><td>${r.name}</td><td>${r.unit}</td><td class="live-val" id="val-${r.key}-${r.axis||'n'}">--</td></tr>`});
+    function generateLiveTable(){
+        let h=''; 
+        liveRegisters.forEach(r=>{
+            let id = `val-${r.key}${r.axis ? '-'+r.axis : ''}`;
+            if(r.addr === 0) h += '<tr class="axis-header"><td colspan="4">X-AXIS</td></tr>';
+            if(r.addr === 20) h += '<tr class="axis-header"><td colspan="4">Y-AXIS</td></tr>';
+            if(r.addr === 40) h += '<tr class="axis-header"><td colspan="4">Z-AXIS</td></tr>';
+            if(r.addr === 60) h += '<tr class="axis-header"><td colspan="4">SYSTEM & CONTROL</td></tr>';
+            
+            let valCell = (r.addr === 95) ? '<i>Write Only</i>' : `<td class="live-val" id="${id}">--</td>`;
+            
+            h+=`<tr>
+                <td><span class="addr-badge">${r.addr}</span></td>
+                <td>${r.name}</td>
+                <td>${r.unit}</td>
+                ${valCell}
+            </tr>`
+        });
         document.getElementById('live-table-body').innerHTML=h;
     }
-    function calculateAddress(){
-        let t=parseInt(document.getElementById('calc-type').value), i=parseInt(document.getElementById('calc-index').value);
-        let res=document.getElementById('calc-result'), max=(t==1)?WF_TOTAL:SP_TOTAL;
-        if(isNaN(i)||i<0||i>=max){res.style.display='block';res.style.backgroundColor='#f8d7da';res.innerText='Invalid Index';return;}
-        let p=Math.floor(i/WINDOW_SIZE), off=i%WINDOW_SIZE;
-        res.style.display='block';res.style.backgroundColor='#d4edda';
-        res.innerHTML=`Write <strong>${t}</strong> to Reg 80. Write Page <strong>${p}</strong> to Reg 81. Read Reg <strong>${WINDOW_START+off}</strong>.`;
-    }
-    function switchTab(n){
-        document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
-        document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
-        document.getElementById(n).classList.add('active');
-    }
-    function updateLive(){
+
+    function updateLiveValues(){
         fetch('/data').then(r=>r.json()).then(d=>{
             liveRegisters.forEach(r=>{
-                let v=(r.axis)?d[r.key][r.axis]:d[r.key];
-                if(document.getElementById(`val-${r.key}-${r.axis||'n'}`)) document.getElementById(`val-${r.key}-${r.axis||'n'}`).textContent=(typeof v === 'number')?v.toFixed(3):'--';
+                if (r.addr === 95) return; // Skip trigger register
+                let v = (r.axis) ? d[r.key][r.axis] : d[r.key];
+                let el = document.getElementById(`val-${r.key}${r.axis ? '-'+r.axis : ''}`);
+                if(el) {
+                    if(typeof v === 'boolean') el.textContent = v ? "1 (YES)" : "0 (NO)";
+                    else if(typeof v === 'number') el.textContent = v.toFixed(3);
+                    else el.textContent = "--";
+                }
             });
         });
     }
+
     function saveSettings(){
-        const e=document.getElementById('enabled').checked, p=document.getElementById('port').value;
-        window.location.href=`/save_modbustcp?enabled=${e}&port=${p}`; return false;
+        const e = document.getElementById('enabled').checked;
+        const p = document.getElementById('port').value;
+        if(confirm("Save settings and reboot device?")) {
+            window.location.href=`/save_modbustcp?enabled=${e}&port=${p}`;
+        }
+        return false;
     }
+
     window.onload=function(){
-        document.getElementById('enabled').checked=)rawliteral" + String(modbusTcpEnabled ? "true" : "false") + R"rawliteral(;
-        document.getElementById('port').value=)rawliteral" + String(modbusTcpPort) + R"rawliteral(;
-        generateTable(WF_TOTAL,'wf-table-body'); generateTable(SP_TOTAL,'sp-table-body'); generateLive();
-        setInterval(updateLive,2000); updateLive();
+        document.getElementById('enabled').checked = )rawliteral" + String(modbusTcpEnabled ? "true" : "false") + R"rawliteral(;
+        document.getElementById('port').value = )rawliteral" + String(modbusTcpPort) + R"rawliteral(;
+        
+        generateLiveTable();
+        setInterval(updateLiveValues, 2000); // Poll every 2s
+        updateLiveValues();
     };
-</script></body></html>
+</script>
+</body>
+</html>
 )rawliteral";
     server.send(200, "text/html", html);
 }
@@ -3031,27 +3217,30 @@ void handleClearSystemLog() {
     server.send(200, "text/plain", "System log cleared.");
 }
 
-void handleDeviceInfo() {
-    String uptime = formatUptime(millis());
-    String localLog;
-    String d_model, d_serial, d_url, d_fw;
-    
-    // Get log safely
+// --- NEW: JSON Handler for Diagnostics ---
+void handleDeviceInfoJson() {
+    DynamicJsonDocument doc(4096);
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        localLog = globalLogBuffer;
-        d_model = sensor_model;
-        d_serial = sensor_serial;
-        d_url = sensor_vendor_url; 
-        d_fw = sensor_fw_version;
+        doc["uptime"] = formatUptime(millis());
+        doc["ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+        doc["rssi"] = (WiFi.status() == WL_CONNECTED) ? String(WiFi.RSSI()) + " dBm" : "N/A";
+        doc["free_ram"] = ESP.getFreeHeap();
+        doc["time"] = getTimestamp();
+        doc["model"] = sensor_model;
+        doc["serial"] = sensor_serial;
+        doc["uuid"] = sensor_uuid; // NEW
+        doc["fw"] = sensor_fw_version;
+        doc["log"] = globalLogBuffer;
         xSemaphoreGive(dataMutex);
     }
-    localLog.replace("\n", "<br>");
+    String json;
+    serializeJson(doc, json);
+    server.send(200, "application/json", json);
+}
 
-    // --- NEW: Internet Connection Check Logic ---
-    bool internetConnected = (WiFi.status() == WL_CONNECTED);
-    String ipAddr = internetConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-    String rssiVal = internetConnected ? String(WiFi.RSSI()) + " dBm" : "N/A";
-    // --------------------------------------------
+void handleDeviceInfo() {
+    // This handler now serves the static HTML shell.
+    // The JS inside fetches data from /device_info_json
 
     String html = R"rawliteral(
 <!DOCTYPE html><html><head><title>Device Diagnostics</title><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3073,37 +3262,74 @@ h2{color:#2c3e50;margin-top:0}.info-grid{display:grid;grid-template-columns:1fr 
 .status-disconnected { color: #e74c3c; font-weight: bold; }
 .nav-link{display:inline-block;margin-top:30px;color:#007bff;text-decoration:none;font-weight:600; border: 1px solid #007bff; padding: 10px 20px; border-radius: 6px; transition: all 0.2s; }
 .nav-link:hover { background-color: #007bff; color: white; }
-</style></head><body><div class="container"><h2>Device Diagnostics</h2>
-<div class="info-grid">
+</style></head>
+<body>
+<div class="container">
+    <h2>Device Diagnostics</h2>
+    
+    <div class="info-grid">
+        <div class="info-item"><span class="info-label">Sensor Model</span><span class="info-value" id="d_model">Loading...</span></div>
+        <div class="info-item"><span class="info-label">Part Number (Serial)</span><span class="info-value" id="d_serial">Loading...</span></div>
+        <div class="info-item"><span class="info-label">Device UUID</span><span class="info-value" id="d_uuid">Loading...</span></div>
+        <div class="info-item"><span class="info-label">Sensor Firmware</span><span class="info-value" id="d_fw">Loading...</span></div>
+        
+        <div class="info-item full-width"><span class="info-label">Vendor URL</span><span class="info-value">)rawliteral" + sensor_vendor_url + R"rawliteral(</span></div>
 
-<div class="info-item"><span class="info-label">Sensor Model</span><span class="info-value">)rawliteral" + d_model + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">Serial Number</span><span class="info-value">)rawliteral" + d_serial + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">Vendor URL</span><span class="info-value">)rawliteral" + d_url + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">Sensor Firmware</span><span class="info-value">)rawliteral" + d_fw + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">Connection Status</span><span class="info-value )rawliteral";
-    html += (internetConnected ? "status-connected" : "status-disconnected");
-    html += R"rawliteral("> )rawliteral";
-    html += (internetConnected ? "Connected to Internet" : "No Internet (AP Mode)");
-    html += R"rawliteral(</span></div>
+        <div class="info-item"><span class="info-label">Connection Status</span><span class="info-value" id="d_status">Checking...</span></div>
+        <div class="info-item"><span class="info-label">Last Reset Reason</span><span class="info-value" style="color:#d63031">)rawliteral" + lastResetReason + R"rawliteral(</span></div>
+        
+        <div class="info-item"><span class="info-label">IP Address</span><span class="info-value" id="d_ip">--</span></div>
+        <div class="info-item"><span class="info-label">Signal Strength (RSSI)</span><span class="info-value" id="d_rssi">--</span></div>
+        
+        <div class="info-item"><span class="info-label">System Time</span><span class="info-value" id="d_time">--</span></div>
+        <div class="info-item"><span class="info-label">System Uptime</span><span class="info-value" id="d_uptime">--</span></div>
+        
+        <div class="info-item"><span class="info-label">Free RAM</span><span class="info-value" id="d_ram">--</span></div>
+        <div class="info-item"><span class="info-label">Firmware Ver</span><span class="info-value">)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></div>
+    </div>
 
-<div class="info-item"><span class="info-label">Last Reset Reason</span><span class="info-value" style="color:#d63031">)rawliteral" + lastResetReason + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">IP Address</span><span class="info-value">)rawliteral" + ipAddr + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">Signal Strength (RSSI)</span><span class="info-value">)rawliteral" + rssiVal + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">System Time</span><span class="info-value">)rawliteral" + getTimestamp() + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">System Uptime</span><span class="info-value">)rawliteral" + uptime + R"rawliteral(</span></div>
-<div class="info-item"><span class="info-label">Free RAM</span><span class="info-value">)rawliteral" + String(ESP.getFreeHeap()) + R"rawliteral( bytes</span></div>
-<div class="info-item"><span class="info-label">Firmware</span><span class="info-value">)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></div>
+    <div class="log-box">
+        <div class="log-header">
+            <h3>System Event Log</h3>
+            <button class="btn-clear" onclick="clearLog()"><i data-lucide="trash-2" style="width:14px;"></i> Clear Log</button>
+        </div>
+        <div class="log-content" id="logContent">Loading log...</div>
+    </div>
+
+    <a href="/settings" class="nav-link">&larr; Back to Settings</a>
 </div>
-<div class="log-box">
-  <div class="log-header">
-    <h3>System Event Log</h3>
-    <button class="btn-clear" onclick="clearLog()"><i data-lucide="trash-2" style="width:14px;"></i> Clear Log</button>
-  </div>
-  <div class="log-content" id="logContent">)rawliteral" + localLog + R"rawliteral(</div>
-</div>
-<a href="/settings" class="nav-link">&larr; Back to Settings</a></div>
+
 <script>
 lucide.createIcons();
+
+function fetchDiagnostics() {
+    fetch('/device_info_json')
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById('d_model').textContent = data.model;
+            document.getElementById('d_serial').textContent = data.serial;
+            document.getElementById('d_uuid').textContent = data.uuid;
+            document.getElementById('d_fw').textContent = data.fw;
+            document.getElementById('d_ip').textContent = data.ip;
+            document.getElementById('d_rssi').textContent = data.rssi;
+            document.getElementById('d_time').textContent = data.time;
+            document.getElementById('d_uptime').textContent = data.uptime;
+            document.getElementById('d_ram').textContent = data.free_ram + " bytes";
+            document.getElementById('logContent').innerHTML = data.log.replace(/\n/g, "<br>");
+            
+            // Connection Status logic
+            const statusEl = document.getElementById('d_status');
+            if (data.ip.startsWith("192.168.4")) {
+                statusEl.textContent = "AP Mode Active (No Internet)";
+                statusEl.className = "info-value status-disconnected";
+            } else {
+                statusEl.textContent = "Connected to WiFi";
+                statusEl.className = "info-value status-connected";
+            }
+        })
+        .catch(err => console.error("Diag Fetch Error:", err));
+}
+
 function clearLog() {
     if(confirm("Clear system event log?")) {
         fetch('/clear_system_log').then(r => r.text()).then(msg => {
@@ -3111,6 +3337,10 @@ function clearLog() {
         });
     }
 }
+
+// Initial fetch and periodic update
+fetchDiagnostics();
+setInterval(fetchDiagnostics, 2000); // Update every 2 seconds
 </script>
 </body></html>)rawliteral";
     server.send(200, "text/html", html);
