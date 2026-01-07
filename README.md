@@ -1,10 +1,12 @@
 # Esp32-Wilcoxon-883M
 Firmware for Industrial IoT Vibration Monitoring using ESP32 and Wilcoxon 883M sensors.
+
 # 🏭 Industrial IoT Vibration Monitor (ESP32 + Wilcoxon 883M)
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-ESP32-blue)
 ![Framework](https://img.shields.io/badge/framework-Arduino-orange)
+![Version](https://img.shields.io/badge/version-3.11.0-blueviolet)
 ![Status](https://img.shields.io/badge/status-Production%20Ready-success)
 
 > **A professional-grade IoT gateway firmware for monitoring industrial machinery vibration using the Wilcoxon 883M (RS485) sensor and the Cytron Maker Feather AIoT S3.**
@@ -93,38 +95,19 @@ Read these registers to get the latest processed values.
 | **8** | X True Peak | x100 | g |
 | **9** | X Crest Factor | x100 | - |
 | **20** | Y Accel RMS | x100 | g |
-| **24** | Y Velocity RMS | x10 | mm/s |
 | **40** | Z Accel RMS | x100 | g |
-| **44** | Z Velocity RMS | x10 | mm/s |
 | **60** | Temperature | x10 | °C |
+| **95** | **PLC Trigger Command** | Write `1` | Triggers a new capture |
 
 #### 2. Large Data Access (Waveform & Spectrum)
-Since Waveforms (13k points) and Spectra (6k points) are too large to read in a single Modbus poll, a **Paging/Windowing** mechanism is used.
+The Gateway maps the latest captured Waveform and Spectrum data to direct address ranges for fast reading.
 
-**Control Registers (Read/Write)**
-| Reg | Description | Values |
-| :--- | :--- | :--- |
-| **80** | **Data Type Select** | `1` = Time Waveform<br>`2` = Frequency Spectrum |
-| **81** | **Page Index** | `0` to `N` (Increments the 125-point window) |
+| Reg Start | Size | Content | Format |
+| :--- | :--- | :--- | :--- |
+| **1000** | 13,334 | Time Waveform (Latest Axis) | Int16 (x0.001 g) |
+| **20000** | 6,145 | FFT Spectrum (Latest Axis) | UInt16 (x0.001 g) |
 
-**Status Registers (Read Only)**
-| Reg | Description | Values |
-| :--- | :--- | :--- |
-| **90** | Waveform Ready | `1` = New data available since last read |
-| **91** | Spectrum Ready | `1` = New data available since last read |
-
-**Data Window (Read Only)**
-| Reg | Description | Size |
-| :--- | :--- | :--- |
-| **100 - 224** | **Data Window** | 125 Registers (Int16) |
-
-**💡 Example: Reading a Full Waveform**
-1.  Write `1` to **Reg 80** (Select Waveform Mode).
-2.  Write `0` to **Reg 81** (Select Page 0).
-3.  Read **Regs 100-224** (You will get points 0-124).
-4.  Write `1` to **Reg 81** (Select Page 1).
-5.  Read **Regs 100-224** (You will get points 125-249).
-6.  Repeat until all 13,334 points are read.
+---
 
 ## ☁️ MQTT Topics & Commands
 
@@ -136,10 +119,8 @@ The device connects to your configured MQTT Broker (supports TLS/SSL) and intera
 
 | Topic | Payload Type | Description |
 | :--- | :--- | :--- |
-| `883M/status` | JSON | **Health Check:** Publishes every 5 minutes.<br>Contains: Uptime, RSSI, IP, Serial Number, Free RAM. |
+| `883M/status` | JSON | **Health Check:** Publishes every 5 minutes.<br>Contains: Uptime, RSSI, IP, Serial Number, **UUID**, Free RAM. |
 | `883M` | JSON | **Metrics:** Object containing scalar values (RMS, Peak, Temp).<br>**Waveform:** Chunked arrays of raw time data.<br>**Spectrum:** Chunked arrays of frequency data. |
-
----
 
 ### 📥 Command Topic (Cloud -> Device)
 
@@ -147,11 +128,8 @@ The device connects to your configured MQTT Broker (supports TLS/SSL) and intera
 
 > **⚠️ CRITICAL REQUIREMENT:**
 > Every command **MUST** include the `serial_number` field matching the device's specific serial number.
-> If the serial number is missing or incorrect, the device will **IGNORE** the command to prevent accidental triggers on other sensors in the network.
 
-#### 1. Trigger Data Capture
-Forces the device to wake up the sensor and capture data for a specific axis.
-
+#### 1. Trigger Data Capture (Single Axis)
 ```json
 {
   "serial_number": "ENTER_DEVICE_SERIAL_HERE",
