@@ -73,18 +73,87 @@ You can use **PlatformIO** (recommended) or Arduino IDE.
 * ⚪ **White:** Wi-Fi Disconnected
 * 🔵 **Cyan:** Metrics Recording Active
 
-### ☁️ MQTT Topics
-The device publishes JSON data to the following topics (default base: `883M`):
+### 🏭 Modbus TCP Server Map
+The ESP32 acts as a Modbus TCP Slave on **Port 502**. This allows SCADA/PLC systems to read cached data.
 
-| Topic | Direction | Description |
+#### 1. Scalar Metrics (Standard Input Registers)
+Read these registers to get the latest processed values.
+
+| Reg | Description | Scale | Unit |
+| :--- | :--- | :--- | :--- |
+| **0** | X Accel RMS | x100 | g |
+| **1** | X Accel Peak | x100 | g |
+| **2** | X Accel RMS (10-5k Hz) | x100 | g |
+| **3** | X Accel Peak (10-5k Hz) | x100 | g |
+| **4** | X Velocity RMS | x10 | mm/s |
+| **5** | X Velocity Peak | x10 | mm/s |
+| **6** | X Displacement RMS | x1 | µm |
+| **7** | X Displacement Peak | x1 | µm |
+| **8** | X True Peak | x100 | g |
+| **9** | X Crest Factor | x100 | - |
+| **20** | Y Accel RMS | x100 | g |
+| **24** | Y Velocity RMS | x10 | mm/s |
+| **40** | Z Accel RMS | x100 | g |
+| **44** | Z Velocity RMS | x10 | mm/s |
+| **60** | Temperature | x10 | °C |
+
+#### 2. Large Data Access (Waveform & Spectrum)
+Since Waveforms (13k points) and Spectra (6k points) are too large to read in a single Modbus poll, a **Paging/Windowing** mechanism is used.
+
+**Control Registers (Read/Write)**
+| Reg | Description | Values |
 | :--- | :--- | :--- |
-| `883M/status` | Out | Device health, uptime, and identity |
-| `883M` | Out | Main metrics payload and waveform chunks |
-| `883M/command` | In | Remote control (Reboot, Trigger Capture) |
+| **80** | **Data Type Select** | `1` = Time Waveform<br>`2` = Frequency Spectrum |
+| **81** | **Page Index** | `0` to `N` (Increments the 125-point window) |
 
-**Example Command (Trigger Capture):**
+**Status Registers (Read Only)**
+| Reg | Description | Values |
+| :--- | :--- | :--- |
+| **90** | Waveform Ready | `1` = New data available since last read |
+| **91** | Spectrum Ready | `1` = New data available since last read |
+
+**Data Window (Read Only)**
+| Reg | Description | Size |
+| :--- | :--- | :--- |
+| **100 - 224** | **Data Window** | 125 Registers (Int16) |
+
+**💡 Example: Reading a Full Waveform**
+1.  Write `1` to **Reg 80** (Select Waveform Mode).
+2.  Write `0` to **Reg 81** (Select Page 0).
+3.  Read **Regs 100-224** (You will get points 0-124).
+4.  Write `1` to **Reg 81** (Select Page 1).
+5.  Read **Regs 100-224** (You will get points 125-249).
+6.  Repeat until all 13,334 points are read.
+
+## ☁️ MQTT Topics & Commands
+
+The device connects to your configured MQTT Broker (supports TLS/SSL) and interacts via JSON payloads.
+
+**Default Base Topic:** `883M` (Configurable in Settings)
+
+### 📤 Published Topics (Device -> Cloud)
+
+| Topic | Payload Type | Description |
+| :--- | :--- | :--- |
+| `883M/status` | JSON | **Health Check:** Publishes every 5 minutes.<br>Contains: Uptime, RSSI, IP, Serial Number, Free RAM. |
+| `883M` | JSON | **Metrics:** Object containing scalar values (RMS, Peak, Temp).<br>**Waveform:** Chunked arrays of raw time data.<br>**Spectrum:** Chunked arrays of frequency data. |
+
+---
+
+### 📥 Command Topic (Cloud -> Device)
+
+**Topic:** `883M/command`
+
+> **⚠️ CRITICAL REQUIREMENT:**
+> Every command **MUST** include the `serial_number` field matching the device's specific serial number.
+> If the serial number is missing or incorrect, the device will **IGNORE** the command to prevent accidental triggers on other sensors in the network.
+
+#### 1. Trigger Data Capture
+Forces the device to wake up the sensor and capture data for a specific axis.
+
 ```json
 {
+  "serial_number": "ENTER_DEVICE_SERIAL_HERE",
   "command": "trigger_capture",
   "axis": "X"
 }
