@@ -450,4 +450,3 @@ OR as a flat line:
 Vibration (g)
 0.00|——————————————— Frequency
 ```
-----
