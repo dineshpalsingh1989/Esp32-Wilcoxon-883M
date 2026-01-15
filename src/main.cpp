@@ -7,12 +7,13 @@
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include "time.h"
-#include <esp_task_wdt.h> 
+#include <esp_task_wdt.h>
 
 // --- OTA Libraries ---
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <Update.h>
 
 // --- Modbus Libraries ---
 #include <ModbusMaster.h> // RS485 Master
@@ -21,36 +22,48 @@
 #include <numeric>
 #include <cmath>
 #include <algorithm>
-#include <map> 
+#include <map>
 
 // --- FreeRTOS ---
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-// Global Mutex
+// Global Mutex & Flags
 SemaphoreHandle_t dataMutex;
+bool shouldReboot = false; // Safe reboot flag
 
-// --- Hardware Config (Cytron Maker Feather AIoT S3) ---
-#define RGB_PIN 46        
+// --- Hardware Config (ESP32-S3-DevKitC-1) ---
+// Onboard RGB LED is typically GPIO 48 on DevKitC-1
+#define RGB_PIN 48        
 #define NUM_PIXELS 1
 Adafruit_NeoPixel pixels(NUM_PIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
-#define BUZZER_PIN 12
-#define USER_BUTTON_PIN 3
+// External Buzzer (Connect to Pin 5)
+#define BUZZER_PIN 5
+
+// User Button (Using BOOT Button = GPIO 0)
+// Pressing BOOT pulls this pin LOW.
+#define USER_BUTTON_PIN 0
+
+// --- MAX485 PIN CONFIGURATION (Moved to UART1) ---
+// We cannot use 43/44 on DevKitC-1 as they are used by the USB-Serial Bridge.
+// Using standard UART1 pins: TX=17, RX=18.
+#define RXD_PIN        18 // Connect to RO (Receiver Output)
+#define TXD_PIN        17 // Connect to DI (Driver Input)
+#define RS485_CTRL_PIN 14 // Connect to DE and RE
 
 // --- WiFi AP Defaults ---
 #define WIFI_AP_SSID "ILA_Sensor_AP"
-#define WIFI_AP_PASS "12345678" // Default Password for AP Mode
+#define WIFI_AP_PASS "12345678"
 
 // --- Device Info (Dynamic) ---
-String sensor_model = "Wilcoxon 883M"; 
-String sensor_serial = "Unknown";     // Holds Part Number (Obj 0x01)
-String sensor_vendor_url = "Unknown"; // Holds Vendor URL (Obj 0x03)
-String sensor_uuid = "Unknown";       // NEW: Holds Device UUID (Obj 0x04)
-String sensor_part_number = "Unknown"; // (Redundant if mapped to serial, but kept for safety)
+String sensor_model = "Wilcoxon 883M";
+String sensor_serial = "Unknown";
+String sensor_vendor_url = "Unknown";
+String sensor_part_number = "Unknown";
 String sensor_fw_version = "Unknown";
-const char* FIRMWARE_VERSION = "3.11.0 - Added UUID";
+const char* FIRMWARE_VERSION = "4.7.0 - S3-DevKitC-1";
 
 // --- NTP & Time Config ---
 const char* ntpServer = "pool.ntp.org";
@@ -58,8 +71,6 @@ long  gmtOffset_sec = 28800; // Default GMT+8
 int   daylightOffset_sec = 0;
 
 // --- MQTT Configuration ---
-// DEFAULTS FOR GITHUB: All sensitive data removed. 
-// Users must configure these via the Web Dashboard.
 bool mqttEnabled = true;
 bool mqtt_use_tls = true;
 bool mqtt_skip_cert_validation = true;
@@ -71,7 +82,7 @@ String mqtt_pass_str = "";
 String mqtt_topic_str = "883M";
 String mqtt_command_topic = "883M/command";
 String mqtt_status_topic = "883M/status";
-char mqttStatus[128] = "Waiting for config..."; 
+char mqttStatus[128] = "Waiting for config...";
 
 // --- Wi-Fi & Web Server ---
 WebServer server(80);
@@ -81,8 +92,6 @@ WiFiClientSecure espClientSecure;
 PubSubClient* mqttClient = nullptr; 
 
 // --- Modbus RTU (RS485) ---
-#define RXD_PIN   16 
-#define TXD_PIN   15 
 uint8_t modbus_slave_id_val = 1;
 long modbus_baud_rate_val = 115200;
 ModbusMaster node;
@@ -92,15 +101,15 @@ bool modbusTcpEnabled = true;
 uint16_t modbusTcpPort = 502;
 ModbusTCP modbusTCPServer;
 
-// --- LINEAR MODBUS MAP (Free Access) ---
-#define HREG_DATA_TYPE_SELECT 80      // Kept for legacy compatibility
+// --- LINEAR MODBUS MAP ---
+#define HREG_DATA_TYPE_SELECT 80        
 #define HREG_WAVEFORM_READY_STATUS 90
 #define HREG_SPECTRUM_READY_STATUS 91
-#define HREG_PLC_TRIGGER_CMD       95 // NEW: Write 1 here to trigger capture
+#define HREG_TRIGGER_WAVEFORM 92
+#define HREG_TRIGGER_SPECTRUM 93
 
-// START ADDRESSES FOR FULL ARRAYS
-#define HREG_WAVEFORM_START 1000      // Registers 1000 - 14333 (13334 points)
-#define HREG_SPECTRUM_START 20000     // Registers 20000 - 26144 (6145 points)
+#define HREG_WAVEFORM_START 1000        // Registers 1000 - 14333
+#define HREG_SPECTRUM_START 20000       // Registers 20000 - 26144
 
 // --- Modbus Addresses (Sensor Side) ---
 #define REG_TRIGGER             0x0200 
@@ -158,7 +167,7 @@ float crestFactorX=0.0, crestFactorY=0.0, crestFactorZ=0.0;
 float stdDeviationX=0.0, stdDeviationY=0.0, stdDeviationZ=0.0;
 float temperature=0.0;
 // Extended Metrics
-float accelMetricRmsX=0.0, accelMetricRmsY=0.0, accelMetricRmsZ=0.0;    
+float accelMetricRmsX=0.0, accelMetricRmsY=0.0, accelMetricRmsZ=0.0;     
 float accelMetricPeakX=0.0, accelMetricPeakY=0.0, accelMetricPeakZ=0.0; 
 float accelMetricRms2X=0.0, accelMetricRms2Y=0.0, accelMetricRms2Z=0.0; 
 float accelMetricPeak2X=0.0, accelMetricPeak2Y=0.0, accelMetricPeak2Z=0.0; 
@@ -209,29 +218,22 @@ const long mqttReconnectInterval = 5000;
 unsigned long lastHealthPublishTime = 0;
 const long healthPublishInterval = 300000; 
 
-// --- Function Prototypes ---
-void handleRoot(); void handleMetrics(); void handleFullWaveform(); void handleFullSpectrum(); void handleSettings();
-void handleWifiSettings(); void handleSaveWifi(); void handleMqttSettings(); void handleSaveMqtt();
-void handleRs485Settings(); void handleSaveRs485(); void handleTriggerCapture(); void handleSetIntervals();
+// --- Forward Declarations ---
+void handleRoot(); void handleMetrics(); void handleFullWaveform(); void handleFullSpectrum(); 
+void handleSettings(); void handleWifiSettings(); void handleSaveWifi(); 
+void handleMqttSettings(); void handleSaveMqtt();
+void handleRs485Settings(); void handleSaveRs485(); 
+void handleTriggerCapture(); void handleSetIntervals();
 void handleGetIntervals(); void handleScanWifi(); void handleNotFound();
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-void publishAlert(String alertType, String details); void logMetrics();
 void handleGetMetricsLogData(); void handleMetricsLogControl(); void handleDownloadMetricsCsv();
 void handleClearMetricsLog(); void handleClearDynamicData(); void handleReboot();
-void handleDeviceInfo(); void handleDeviceInfoJson(); // Added Prototype
-void handleModbusTcpSettings(); void handleSaveModbusTcp();
+void handleDeviceInfo(); void handleModbusTcpSettings(); void handleSaveModbusTcp();
 void handleSetMetricsInterval(); 
 void handleTimeSettings(); void handleSaveTimeSettings(); void handleSetManualTime();
-String formatUptime(unsigned long ms);
-void publishProgressUpdate(const char* progress_message);
-void handleMqttStatus();
-void updateModbusTCPCache();
-void syncModbusRegisters();
-void logMessage(String msg);
-String getResetReasonString();
 void handleClearSystemLog();
-void readDeviceIdentification();
-void setupOTA();
+void handleUpdateResult(); 
+void handleUpdateUpload();
+void handleMqttStatus();
 
 // =================================================================
 // --- UTILITY FUNCTIONS
@@ -316,7 +318,7 @@ void updateLedStatus() {
         }
         return;
     }
-    if (strstr(local_status, "failed") != NULL || strstr(local_status, "Error") != NULL || strstr(local_status, "Timeout") != NULL) {
+    if (strstr(local_status, "failed") != NULL || strstr(local_status, "Error") != NULL || strstr(local_status, "Timeout") != NULL || strstr(local_status, "Disconnected") != NULL) {
         pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // Red
     } else if (WiFi.status() != WL_CONNECTED) {
         pixels.setPixelColor(0, pixels.Color(200, 200, 200)); // White
@@ -329,23 +331,22 @@ void updateLedStatus() {
 std::vector<SpectrumPeak> findSpectrumPeaks(const int16_t* spectrum_buffer, int num_peaks) {
     std::vector<SpectrumPeak> all_points;
     all_points.reserve(SPECTRUM_TOTAL_POINTS);
-
     for (int i = 0; i < SPECTRUM_TOTAL_POINTS; i++) {
-        all_points.push_back({
-            .frequency_hz = i * SPECTRUM_FREQ_RESOLUTION,
-            .amplitude_g = abs(spectrum_buffer[i] * SPECTRUM_SCALE_FACTOR)
-        });
+        all_points.push_back({ .frequency_hz = i * SPECTRUM_FREQ_RESOLUTION, .amplitude_g = abs(spectrum_buffer[i] * SPECTRUM_SCALE_FACTOR) });
     }
-    std::sort(all_points.begin(), all_points.end(), [](const SpectrumPeak& a, const SpectrumPeak& b) {
-        return a.amplitude_g > b.amplitude_g;
-    });
-    if (all_points.size() > num_peaks) {
-        all_points.resize(num_peaks);
-    }
-    std::sort(all_points.begin(), all_points.end(), [](const SpectrumPeak& a, const SpectrumPeak& b) {
-        return a.frequency_hz < b.frequency_hz;
-    });
+    std::sort(all_points.begin(), all_points.end(), [](const SpectrumPeak& a, const SpectrumPeak& b) { return a.amplitude_g > b.amplitude_g; });
+    if (all_points.size() > num_peaks) { all_points.resize(num_peaks); }
+    std::sort(all_points.begin(), all_points.end(), [](const SpectrumPeak& a, const SpectrumPeak& b) { return a.frequency_hz < b.frequency_hz; });
     return all_points;
+}
+
+// --- MAX485 CALLBACKS ---
+void preTransmission() {
+  digitalWrite(RS485_CTRL_PIN, HIGH); // DE/RE High = Transmit
+}
+
+void postTransmission() {
+  digitalWrite(RS485_CTRL_PIN, LOW);  // DE/RE Low = Receive
 }
 
 // =================================================================
@@ -354,85 +355,60 @@ std::vector<SpectrumPeak> findSpectrumPeaks(const int16_t* spectrum_buffer, int 
 void fetchSensorIdentity() {
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
     
-    logMessage("[System] Fetching Sensor Identity (Dual Query Mode)...");
+    logMessage("[System] Fetching Sensor Identity...");
 
-    // We must run TWO separate queries to get all data:
-    // Query 1 (Code 0x01): Basic -> Gets Firmware (Obj 0x02) and Product Code (Obj 0x01)
-    // Query 2 (Code 0x02): Regular -> Gets Model (Obj 0x05) and Serial/UUID (Obj 0x04)
-    
+    // Must enable TX manually for raw serial writes
+    digitalWrite(RS485_CTRL_PIN, HIGH);
+    delay(2);
+
     uint8_t readCodes[2] = {0x01, 0x02};
-
     for (int q = 0; q < 2; q++) {
         uint8_t currentCode = readCodes[q];
-        
-        // 1. Flush UART buffers
         while(Serial1.available()) Serial1.read();
         
-        // 2. Construct Request: [SlaveID, 2B, 0E, ReadCode, 00, CRC, CRC]
         uint8_t request[] = {modbus_slave_id_val, 0x2B, 0x0E, currentCode, 0x00, 0x00, 0x00};
-        
-        // Calculate CRC manually
         uint16_t crc = 0xFFFF;
         for (int i = 0; i < 5; i++) {
             crc ^= request[i];
-            for (int j = 0; j < 8; j++) {
-                if (crc & 1) crc = (crc >> 1) ^ 0xA001;
-                else crc >>= 1;
-            }
+            for (int j = 0; j < 8; j++) { if (crc & 1) crc = (crc >> 1) ^ 0xA001; else crc >>= 1; }
         }
-        request[5] = crc & 0xFF;
-        request[6] = crc >> 8;
+        request[5] = crc & 0xFF; request[6] = crc >> 8;
 
-        // 3. Send Request
         Serial1.write(request, 7);
-        Serial1.flush(); 
-
-        // 4. WAIT (Simulate Python time.sleep(0.3))
+        Serial1.flush(); // Wait for TX to finish
+        
+        // Switch to RX immediately after flush
+        digitalWrite(RS485_CTRL_PIN, LOW); 
         delay(300); 
 
-        // 5. Read Buffer
         uint8_t buffer[256]; 
         int idx = 0;
-        while(Serial1.available() && idx < 256) {
-            buffer[idx++] = Serial1.read();
-        }
+        while(Serial1.available() && idx < 256) { buffer[idx++] = Serial1.read(); }
 
-        // 6. Parse Response
         if (idx > 8 && buffer[1] == 0x2B && buffer[2] == 0x0E && buffer[3] == currentCode) {
-            int objCount = buffer[7]; // Number of objects returned
-            int ptr = 8; // Start of first object
-            
+            int objCount = buffer[7]; int ptr = 8; 
             for (int i = 0; i < objCount; i++) {
-                if (ptr + 2 >= idx) break; // Safety check
-                
-                uint8_t objId = buffer[ptr];
-                uint8_t objLen = buffer[ptr+1];
+                if (ptr + 2 >= idx) break; 
+                uint8_t objId = buffer[ptr]; uint8_t objLen = buffer[ptr+1];
                 String objData = "";
-                
-                // Extract String
-                for (int k = 0; k < objLen; k++) {
-                    if (ptr + 2 + k < idx) objData += (char)buffer[ptr + 2 + k];
-                }
-                
-                // --- MAPPING LOGIC ---
-                // Found in Basic Query (0x01)
-                if (objId == 0x01) sensor_serial = objData;     // Part Number -> Serial Field
-                if (objId == 0x02) sensor_fw_version = objData;  // Firmware Version
-                
-                // Found in Regular Query (0x02)
-                if (objId == 0x05) sensor_model = objData;       // Model Name
-                if (objId == 0x03) sensor_vendor_url = objData;  // Vendor URL
-                if (objId == 0x04) sensor_uuid = objData;        // NEW: Device UUID
-                
-                ptr += (2 + objLen); // Move to next object
+                for (int k = 0; k < objLen; k++) { if (ptr + 2 + k < idx) objData += (char)buffer[ptr + 2 + k]; }
+                if (objId == 0x01) sensor_serial = objData;        
+                if (objId == 0x02) sensor_fw_version = objData;  
+                if (objId == 0x05) sensor_model = objData;        
+                if (objId == 0x03) sensor_vendor_url = objData;  
+                if (objId == 0x04) sensor_part_number = objData; 
+                ptr += (2 + objLen); 
             }
-        } else {
-             logMessage("[System] ID Query " + String(currentCode) + " failed. Bytes: " + String(idx));
         }
-        delay(100); // Pause between queries
+        delay(100); 
+        // Re-enable TX for next loop iteration
+        digitalWrite(RS485_CTRL_PIN, HIGH);
     }
     
-    logMessage("[System] ID Result -> Model: " + sensor_model + " | P/N: " + sensor_serial + " | UUID: " + sensor_uuid);
+    // Ensure we end in RX mode
+    digitalWrite(RS485_CTRL_PIN, LOW);
+
+    logMessage("[System] ID Result -> Model: " + sensor_model + " | Serial: " + sensor_serial + " | PN: " + sensor_part_number);
     xSemaphoreGive(dataMutex);
 }
 
@@ -443,8 +419,7 @@ void publishDeviceHealth() {
     if (!mqttClient || !mqttClient->connected()) return;
     DynamicJsonDocument doc(2048); 
     doc["model"] = sensor_model; 
-    doc["serial_number"] = sensor_serial; // Part Number
-    doc["device_uuid"] = sensor_uuid;     // NEW: Actual UUID
+    doc["serial_number"] = sensor_serial; 
     doc["vendor_url"] = sensor_vendor_url; 
     doc["timestamp"] = getTimestamp();
     doc["type"] = "health_status";
@@ -578,6 +553,8 @@ void publishFullWaveformInChunks(Axis capturedAxis) {
     }
 
     for (int i = 0; i < totalChunks; i++) {
+        esp_task_wdt_reset(); 
+        
         DynamicJsonDocument doc(4096); 
         doc["model"] = sensor_model;
         doc["serial_number"] = sensor_serial;
@@ -627,6 +604,8 @@ void publishFullSpectrumInChunks(Axis capturedAxis) {
     }
 
     for (int i = 0; i < totalChunks; i++) {
+        esp_task_wdt_reset(); 
+        
         DynamicJsonDocument doc(4096); 
         doc["model"] = sensor_model;
         doc["serial_number"] = sensor_serial;
@@ -702,11 +681,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String topic_str(topic);
     DynamicJsonDocument doc(1024);
     deserializeJson(doc, payload, length);
-    // Note: Checking against global variable which is updated at runtime
+    
     const char* target_sn = doc["serial_number"];
-
-    // Accept if SN matches OR if message has no SN (generic broadcast to this topic)
-    if (!target_sn || String(target_sn) == sensor_serial) {
+    
+    // --- STRICT SERIAL NUMBER MATCHING LOGIC ---
+    if (target_sn && String(target_sn) == sensor_serial) {
+        
         const char* command = doc["command"];
         if (command) {
             logMessage("MQTT Command received: " + String(command));
@@ -717,19 +697,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             }
             
             if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                // --- COMMAND: TRIGGER_ALL (Collects X, Y, Z sequentially) ---
                 if (strcmp(command, "trigger_all") == 0) {
-                    requestedAxis = AXIS_X;             // Start with X
-                    requestedCapture = CAPTURE_BOTH;    // Get Wave + Spectrum
-                    currentDataState = DD_REQUEST_DATA; // Start Machine
+                    requestedAxis = AXIS_X;                 
+                    requestedCapture = CAPTURE_BOTH;        
+                    currentDataState = DD_REQUEST_DATA; 
                     
-                    isAutoCaptureCycleActive = true;    // Enable auto-switching to Y and Z
-                    autoCaptureAxisIndex = 0;           // Reset cycle counter
-                    xyzPeakDataCache.clear();           // Clear cache
+                    isAutoCaptureCycleActive = true;        
+                    autoCaptureAxisIndex = 0;               
+                    xyzPeakDataCache.clear();               
                     
                     logMessage("MQTT: Starting Full XYZ Capture Sequence");
                 }
-                // --- COMMAND: TRIGGER_CAPTURE (Single Axis) ---
                 else if (strcmp(command, "trigger_capture") == 0) {
                     String axis = doc["axis"] | "X";
                     if(axis == "X") requestedAxis = AXIS_X;
@@ -739,11 +717,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                     if(requestedAxis != AXIS_NONE) {
                         requestedCapture = CAPTURE_BOTH;
                         currentDataState = DD_REQUEST_DATA;
-                        isAutoCaptureCycleActive = false; // Do NOT cycle, just one axis
+                        isAutoCaptureCycleActive = false; 
                         logMessage("MQTT: Triggering Single Axis " + axis);
                     }
                 } 
-                // --- COMMAND: SET INTERVAL ---
                 else if (strcmp(command, "set_interval") == 0) {
                     long newInterval = doc["interval_ms"];
                     if (newInterval > 0) {
@@ -756,8 +733,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                 } 
                 xSemaphoreGive(dataMutex);
             }
-            if (strcmp(command, "reboot") == 0) { logMessage("Remote reboot requested."); delay(500); ESP.restart(); } 
+            if (strcmp(command, "reboot") == 0) { 
+                logMessage("Remote reboot requested. Restarting..."); 
+                shouldReboot = true; 
+            } 
         }
+    } else {
+        String receivedSN = target_sn ? String(target_sn) : "MISSING";
+        logMessage("[MQTT] Command IGNORED. SN mismatch. Received: " + receivedSN + ", Device: " + sensor_serial);
     }
 }
 
@@ -799,6 +782,8 @@ bool readLargeDataBlock(uint16_t startAddress, uint16_t totalPoints, int16_t* bu
     }
 
     while (pointsRead < totalPoints) {
+        esp_task_wdt_reset(); 
+
         if (modbusTcpEnabled) {
              modbusTCPServer.task();
         }
@@ -855,7 +840,6 @@ void logMetrics() {
         entry.values[24] = stdDeviationX; entry.values[25] = stdDeviationY; entry.values[26] = stdDeviationZ;
         entry.values[27] = accelRms2X; entry.values[28] = accelRms2Y; entry.values[29] = accelRms2Z;
         entry.values[30] = temperature;
-        // New metrics 
         entry.values[31] = accelMetricRmsX; entry.values[32] = accelMetricRmsY; entry.values[33] = accelMetricRmsZ;
         entry.values[34] = accelMetricPeakX; entry.values[35] = accelMetricPeakY; entry.values[36] = accelMetricPeakZ;
         entry.values[37] = accelMetricRms2X; entry.values[38] = accelMetricRms2Y; entry.values[39] = accelMetricRms2Z;
@@ -906,7 +890,16 @@ void handleLongReads() {
             if (success) {
                 newWaveformAvailable = true;
                 isReadingSpectrum = true; 
-                if(modbusTcpEnabled) modbusTCPServer.Hreg(HREG_WAVEFORM_READY_STATUS, 1);
+                
+                // --- UPDATE MODBUS STATUS FOR PLC ---
+                if(modbusTcpEnabled) {
+                    uint16_t statusVal = 0;
+                    if(local_requestedAxis == AXIS_X) statusVal = 2;
+                    else if(local_requestedAxis == AXIS_Y) statusVal = 3;
+                    else if(local_requestedAxis == AXIS_Z) statusVal = 4;
+                    modbusTCPServer.Hreg(HREG_WAVEFORM_READY_STATUS, statusVal);
+                }
+                
                 snprintf(systemStatus, sizeof(systemStatus), "Waveform (%c) Done. Reading Spectrum...", axisChar);
             } else {
                 snprintf(systemStatus, sizeof(systemStatus), "Waveform Download Failed");
@@ -942,7 +935,16 @@ void handleLongReads() {
             String ts = getTimestamp();
             if (success) {
                 newSpectrumAvailable = true;
-                if(modbusTcpEnabled) modbusTCPServer.Hreg(HREG_SPECTRUM_READY_STATUS, 1);
+                
+                // --- UPDATE MODBUS STATUS FOR PLC ---
+                if(modbusTcpEnabled) {
+                    uint16_t statusVal = 0;
+                    if(local_requestedAxis == AXIS_X) statusVal = 2;
+                    else if(local_requestedAxis == AXIS_Y) statusVal = 3;
+                    else if(local_requestedAxis == AXIS_Z) statusVal = 4;
+                    modbusTCPServer.Hreg(HREG_SPECTRUM_READY_STATUS, statusVal);
+                }
+
                 strncpy(lastCaptureTimestamp, ts.c_str(), sizeof(lastCaptureTimestamp) - 1);
                 lastCapturedAxis = local_requestedAxis;
                 snprintf(systemStatus, sizeof(systemStatus), "Capture complete for %c-axis.", axisChar);
@@ -1082,23 +1084,18 @@ void updateModbusTCPCache() {
     }
 }
 
-// --- UPDATED: COPY FULL BUFFERS TO MODBUS REGISTERS ---
-// This runs only when new data is available to keep the loop fast.
+// --- COPY FULL BUFFERS TO MODBUS REGISTERS ---
 void syncModbusRegisters() {
     if (!modbusTcpEnabled) return;
 
-    // Use a mutex check to ensure we don't read while writing
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         
-        // 1. Sync Waveform if available
-        // Note: Writing 13,000 registers takes a few milliseconds but is safe on ESP32-S3
         if (newWaveformAvailable) {
             for (int i = 0; i < WAVEFORM_TOTAL_POINTS; i++) {
                 modbusTCPServer.Hreg(HREG_WAVEFORM_START + i, fullWaveform[i]);
             }
         }
 
-        // 2. Sync Spectrum if available
         if (newSpectrumAvailable) {
             for (int i = 0; i < SPECTRUM_TOTAL_POINTS; i++) {
                 modbusTCPServer.Hreg(HREG_SPECTRUM_START + i, spectrumData[i]);
@@ -1108,7 +1105,6 @@ void syncModbusRegisters() {
         xSemaphoreGive(dataMutex);
     }
 }
-
 // =================================================================
 // --- OTA CONFIGURATION
 // =================================================================
@@ -1119,7 +1115,6 @@ void setupOTA() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
     else type = "filesystem";
-    // Unmount filesystem if necessary
     logMessage("Start updating " + type);
   });
 
@@ -1128,8 +1123,6 @@ void setupOTA() {
   });
 
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    // Optional: Print progress to Serial if connected
-    // Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
   });
 
   ArduinoOTA.onError([](ota_error_t error) {
@@ -1150,7 +1143,6 @@ void setupOTA() {
 // --- RTOS TASKS ---
 // =================================================================
 void webServerLoop(void * pvParameters) {
-    // OTA Handle must run in a loop with network access
     for(;;) { 
         server.handleClient(); 
         ArduinoOTA.handle(); // Check for OTA updates
@@ -1160,7 +1152,7 @@ void webServerLoop(void * pvParameters) {
 
 void backgroundLoop(void * pvParameters) {
     esp_task_wdt_config_t twdt_config = {
-        .timeout_ms = 30000,
+        .timeout_ms = 60000,
         .idle_core_mask = (1 << 1), 
         .trigger_panic = true
     };
@@ -1168,7 +1160,15 @@ void backgroundLoop(void * pvParameters) {
     esp_task_wdt_add(NULL); 
     
     for(;;) {
+        // --- FIX: Feed watchdog every loop iteration ---
         esp_task_wdt_reset(); 
+
+        // --- NEW: Safe Reboot Handler ---
+        if (shouldReboot) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            ESP.restart();
+        }
+        // --------------------------------
 
         bool isWifiConnected = (WiFi.status() == WL_CONNECTED);
 
@@ -1228,20 +1228,13 @@ void backgroundLoop(void * pvParameters) {
                     
                     esp_task_wdt_reset(); 
 
-                    // --- UPDATED: MQTT Connect with Last Will & Testament (LWT) ---
-                    // If device dies, Broker publishes "offline" to status topic automatically
-                    String lwtPayload = "{\"status\":\"offline\",\"reason\":\"unexpected_disconnect\"}";
-                    
-                    if (mqttClient->connect("esp32-ila-sensor", mqtt_user_str.c_str(), mqtt_pass_str.c_str(), 
-                                           mqtt_status_topic.c_str(), 1, true, lwtPayload.c_str())) {
-                                           
+                    if (mqttClient->connect("esp32-ila-sensor", mqtt_user_str.c_str(), mqtt_pass_str.c_str())) {
                          logMessage("[MQTT] Connected to " + mqtt_server_str);
                          if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             snprintf(mqttStatus, sizeof(mqttStatus), "Connected");
                             xSemaphoreGive(dataMutex);
                          }
                         mqttClient->subscribe(mqtt_command_topic.c_str());
-                        publishDeviceHealth(); // Announce online immediately
                     } else {
                          logMessage("[MQTT] Connect Failed rc=" + String(mqttClient->state()));
                     }
@@ -1256,36 +1249,14 @@ void backgroundLoop(void * pvParameters) {
             }
         }
 
-        if (modbusTcpEnabled) { 
-            modbusTCPServer.task(); 
-            
-            // --- NEW: PLC Remote Trigger Check (Register 95) ---
-            if (modbusTCPServer.Hreg(HREG_PLC_TRIGGER_CMD) == 1) {
-                logMessage("Modbus TCP: Trigger received from PLC/SCADA");
-                
-                // Reset register immediately to prevent loop triggering
-                modbusTCPServer.Hreg(HREG_PLC_TRIGGER_CMD, 0); 
-                
-                // Initiate Capture Sequence (X-Axis Start)
-                if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    requestedAxis = AXIS_X;
-                    requestedCapture = CAPTURE_BOTH;
-                    currentDataState = DD_REQUEST_DATA;
-                    
-                    isAutoCaptureCycleActive = true; 
-                    autoCaptureAxisIndex = 0;
-                    xyzPeakDataCache.clear();
-                    xSemaphoreGive(dataMutex);
-                }
-            }
-        }
+        if (modbusTcpEnabled) { modbusTCPServer.task(); }
         updateLedStatus();
         
         handleLongReads(); // Handles the actual Modbus reading state machine
 
         // Sync Modbus TCP registers if new data arrived
         static unsigned long lastModbusSync = 0;
-        if (millis() - lastModbusSync > 1000) { // Update registers every second if needed
+        if (millis() - lastModbusSync > 1000) { 
              syncModbusRegisters();
              lastModbusSync = millis();
         }
@@ -1302,6 +1273,7 @@ void backgroundLoop(void * pvParameters) {
                 lastMetricsReadTime = millis();
                 bool read_ok = true;
                 
+                // Temporary buffers
                 float t_ax, t_ay, t_az, t_apx, t_apy, t_apz, t_ax2, t_ay2, t_az2, t_apx2, t_apy2, t_apz2;
                 float t_vx, t_vy, t_vz, t_vpx, t_vpy, t_vpz, t_dx, t_dy, t_dz, t_dpx, t_dpy, t_dpz;
                 float t_tpx, t_tpy, t_tpz, t_cfx, t_cfy, t_cfz, t_sdx, t_sdy, t_sdz, t_t;
@@ -1310,24 +1282,37 @@ void backgroundLoop(void * pvParameters) {
                 float t_dlx, t_dly, t_dlz, t_dlpx, t_dlpy, t_dlpz;
 
                 uint8_t result;
-                result = node.readInputRegisters(0x0000, 3); if(result == node.ku8MBSuccess) { t_ax=(int16_t)node.getResponseBuffer(0)/100.0; t_ay=(int16_t)node.getResponseBuffer(1)/100.0; t_az=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0004, 3); if(result == node.ku8MBSuccess) { t_apx=(int16_t)node.getResponseBuffer(0)/100.0; t_apy=(int16_t)node.getResponseBuffer(1)/100.0; t_apz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0008, 3); if(result == node.ku8MBSuccess) { t_mamx=(int16_t)node.getResponseBuffer(0)/10.0; t_mamy=(int16_t)node.getResponseBuffer(1)/10.0; t_mamz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x000C, 3); if(result == node.ku8MBSuccess) { t_mapx=(int16_t)node.getResponseBuffer(0)/10.0; t_mapy=(int16_t)node.getResponseBuffer(1)/10.0; t_mapz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0010, 3); if(result == node.ku8MBSuccess) { t_ax2=(int16_t)node.getResponseBuffer(0)/100.0; t_ay2=(int16_t)node.getResponseBuffer(1)/100.0; t_az2=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0014, 3); if(result == node.ku8MBSuccess) { t_apx2=(int16_t)node.getResponseBuffer(0)/100.0; t_apy2=(int16_t)node.getResponseBuffer(1)/100.0; t_apz2=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0018, 3); if(result == node.ku8MBSuccess) { t_mam2x=(int16_t)node.getResponseBuffer(0)/10.0; t_mam2y=(int16_t)node.getResponseBuffer(1)/10.0; t_mam2z=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x001C, 3); if(result == node.ku8MBSuccess) { t_map2x=(int16_t)node.getResponseBuffer(0)/10.0; t_map2y=(int16_t)node.getResponseBuffer(1)/10.0; t_map2z=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0020, 3); if(result == node.ku8MBSuccess) { t_vx=(int16_t)node.getResponseBuffer(0)/10.0; t_vy=(int16_t)node.getResponseBuffer(1)/10.0; t_vz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0024, 3); if(result == node.ku8MBSuccess) { t_vpx=(int16_t)node.getResponseBuffer(0)/10.0; t_vpy=(int16_t)node.getResponseBuffer(1)/10.0; t_vpz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0028, 3); if(result == node.ku8MBSuccess) { t_vwx=(int16_t)node.getResponseBuffer(0)/10.0; t_vwy=(int16_t)node.getResponseBuffer(1)/10.0; t_vwz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x002C, 3); if(result == node.ku8MBSuccess) { t_vwpx=(int16_t)node.getResponseBuffer(0)/10.0; t_vwpy=(int16_t)node.getResponseBuffer(1)/10.0; t_vwpz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0030, 3); if(result == node.ku8MBSuccess) { t_dlx=(int16_t)node.getResponseBuffer(0)/1.0; t_dly=(int16_t)node.getResponseBuffer(1)/1.0; t_dlz=(int16_t)node.getResponseBuffer(2)/1.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0034, 3); if(result == node.ku8MBSuccess) { t_dlpx=(int16_t)node.getResponseBuffer(0)/1.0; t_dlpy=(int16_t)node.getResponseBuffer(1)/1.0; t_dlpz=(int16_t)node.getResponseBuffer(2)/1.0; t_dpx=(int16_t)node.getResponseBuffer(0)/1.0; t_dpy=(int16_t)node.getResponseBuffer(1)/1.0; t_dpz=(int16_t)node.getResponseBuffer(2)/1.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0040, 3); if(result == node.ku8MBSuccess) { t_tpx=(int16_t)node.getResponseBuffer(0)/100.0; t_tpy=(int16_t)node.getResponseBuffer(1)/100.0; t_tpz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0044, 3); if(result == node.ku8MBSuccess) { t_cfx=(int16_t)node.getResponseBuffer(0)/100.0; t_cfy=(int16_t)node.getResponseBuffer(1)/100.0; t_cfz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                result = node.readInputRegisters(0x0048, 3); if(result == node.ku8MBSuccess) { t_sdx=(int16_t)node.getResponseBuffer(0)/100.0; t_sdy=(int16_t)node.getResponseBuffer(1)/100.0; t_sdz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(10);
-                read_ok &= readSensorValue("Temperature", 0x0050, 10.0, t_t);
+
+                // --- CRITICAL WDT FIX: Fail Fast on First Read ---
+                result = node.readInputRegisters(0x0000, 3); 
+                if (result == node.ku8MBSuccess) { 
+                    t_ax = (int16_t)node.getResponseBuffer(0)/100.0; 
+                    t_ay = (int16_t)node.getResponseBuffer(1)/100.0; 
+                    t_az = (int16_t)node.getResponseBuffer(2)/100.0;
+                } else {
+                    read_ok = false;
+                }
+                
+                if (read_ok) { // Only proceed if first read worked
+                    vTaskDelay(5);
+                    result = node.readInputRegisters(0x0004, 3); if(result == node.ku8MBSuccess) { t_apx=(int16_t)node.getResponseBuffer(0)/100.0; t_apy=(int16_t)node.getResponseBuffer(1)/100.0; t_apz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(5);
+                    if(read_ok) { result = node.readInputRegisters(0x0008, 3); if(result == node.ku8MBSuccess) { t_mamx=(int16_t)node.getResponseBuffer(0)/10.0; t_mamy=(int16_t)node.getResponseBuffer(1)/10.0; t_mamz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x000C, 3); if(result == node.ku8MBSuccess) { t_mapx=(int16_t)node.getResponseBuffer(0)/10.0; t_mapy=(int16_t)node.getResponseBuffer(1)/10.0; t_mapz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0010, 3); if(result == node.ku8MBSuccess) { t_ax2=(int16_t)node.getResponseBuffer(0)/100.0; t_ay2=(int16_t)node.getResponseBuffer(1)/100.0; t_az2=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0014, 3); if(result == node.ku8MBSuccess) { t_apx2=(int16_t)node.getResponseBuffer(0)/100.0; t_apy2=(int16_t)node.getResponseBuffer(1)/100.0; t_apz2=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0018, 3); if(result == node.ku8MBSuccess) { t_mam2x=(int16_t)node.getResponseBuffer(0)/10.0; t_mam2y=(int16_t)node.getResponseBuffer(1)/10.0; t_mam2z=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x001C, 3); if(result == node.ku8MBSuccess) { t_map2x=(int16_t)node.getResponseBuffer(0)/10.0; t_map2y=(int16_t)node.getResponseBuffer(1)/10.0; t_map2z=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0020, 3); if(result == node.ku8MBSuccess) { t_vx=(int16_t)node.getResponseBuffer(0)/10.0; t_vy=(int16_t)node.getResponseBuffer(1)/10.0; t_vz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0024, 3); if(result == node.ku8MBSuccess) { t_vpx=(int16_t)node.getResponseBuffer(0)/10.0; t_vpy=(int16_t)node.getResponseBuffer(1)/10.0; t_vpz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0028, 3); if(result == node.ku8MBSuccess) { t_vwx=(int16_t)node.getResponseBuffer(0)/10.0; t_vwy=(int16_t)node.getResponseBuffer(1)/10.0; t_vwz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x002C, 3); if(result == node.ku8MBSuccess) { t_vwpx=(int16_t)node.getResponseBuffer(0)/10.0; t_vwpy=(int16_t)node.getResponseBuffer(1)/10.0; t_vwpz=(int16_t)node.getResponseBuffer(2)/10.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0030, 3); if(result == node.ku8MBSuccess) { t_dlx=(int16_t)node.getResponseBuffer(0)/1.0; t_dly=(int16_t)node.getResponseBuffer(1)/1.0; t_dlz=(int16_t)node.getResponseBuffer(2)/1.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0034, 3); if(result == node.ku8MBSuccess) { t_dlpx=(int16_t)node.getResponseBuffer(0)/1.0; t_dlpy=(int16_t)node.getResponseBuffer(1)/1.0; t_dlpz=(int16_t)node.getResponseBuffer(2)/1.0; t_dpx=(int16_t)node.getResponseBuffer(0)/1.0; t_dpy=(int16_t)node.getResponseBuffer(1)/1.0; t_dpz=(int16_t)node.getResponseBuffer(2)/1.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0040, 3); if(result == node.ku8MBSuccess) { t_tpx=(int16_t)node.getResponseBuffer(0)/100.0; t_tpy=(int16_t)node.getResponseBuffer(1)/100.0; t_tpz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0044, 3); if(result == node.ku8MBSuccess) { t_cfx=(int16_t)node.getResponseBuffer(0)/100.0; t_cfy=(int16_t)node.getResponseBuffer(1)/100.0; t_cfz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { result = node.readInputRegisters(0x0048, 3); if(result == node.ku8MBSuccess) { t_sdx=(int16_t)node.getResponseBuffer(0)/100.0; t_sdy=(int16_t)node.getResponseBuffer(1)/100.0; t_sdz=(int16_t)node.getResponseBuffer(2)/100.0;} else read_ok=false; vTaskDelay(5); }
+                    if(read_ok) { read_ok &= readSensorValue("Temperature", 0x0050, 10.0, t_t); }
+                }
 
                 if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (read_ok) {
@@ -1369,8 +1354,10 @@ void backgroundLoop(void * pvParameters) {
                         if(local_isMetricsRecording) { logMetrics(); }
                         if (modbusTcpEnabled) { updateModbusTCPCache(); syncModbusRegisters(); } // Use syncModbusRegisters
                     } else {
-                        snprintf(systemStatus, sizeof(systemStatus), "Error reading metrics");
-                        logMessage("Error reading metrics from sensor.");
+                        // --- FAULT HANDLING ---
+                        snprintf(systemStatus, sizeof(systemStatus), "Sensor Disconnected");
+                        logMessage("Error reading metrics: Sensor likely disconnected.");
+                        strcpy(trafficLightStatus, "ERROR"); 
                         xSemaphoreGive(dataMutex);
                     }
                 }
@@ -1470,6 +1457,40 @@ void backgroundLoop(void * pvParameters) {
 }
 
 // =================================================================
+// --- FIRMWARE UPDATE HANDLERS (Manual OTA)
+// =================================================================
+void handleUpdateResult() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", "<h1>Update Complete.</h1><p>Device is rebooting... <a href='/'>Click here to return</a> in 20 seconds.</p>");
+    delay(1000);
+    ESP.restart();
+}
+
+void handleUpdateUpload() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        logMessage("Firmware Update Started: " + upload.filename);
+        // Disable Watchdog for long updates prevents reboots during flash
+        esp_task_wdt_deinit(); 
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { 
+            Update.printError(Serial);
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        // Flashing firmware to ESP
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Update.printError(Serial);
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) { // true to set the size to the current progress
+            logMessage("Firmware Update Success: " + String(upload.totalSize) + " bytes.");
+        } else {
+            Update.printError(Serial);
+            logMessage("Firmware Update Failed.");
+        }
+    }
+}
+
+// =================================================================
 // --- SETUP & MAIN LOOP
 // =================================================================
 void setup() {
@@ -1490,15 +1511,18 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
     
-    // --- NEW: Boot/Reset Beep Sequence ---
+    // --- Boot/Reset Beep Sequence ---
     tone(BUZZER_PIN, 2000, 100); 
     delay(150);
     tone(BUZZER_PIN, 2500, 200); 
     delay(200);
     noTone(BUZZER_PIN);
-    // -------------------------------------
 
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
+    // --- MAX485 Control Pin Setup ---
+    pinMode(RS485_CTRL_PIN, OUTPUT);
+    digitalWrite(RS485_CTRL_PIN, LOW); // Default to Receive Mode
 
     logMessage("--- System Starting ---");
     logMessage("Reset Reason: " + lastResetReason);
@@ -1565,30 +1589,36 @@ void setup() {
 
     // 6. Init Modbus
     Serial1.begin(modbus_baud_rate_val, SERIAL_8N1, RXD_PIN, TXD_PIN);
+    
+    // --- Register MAX485 Callbacks ---
+    node.preTransmission(preTransmission);
+    node.postTransmission(postTransmission);
+    
     node.begin(modbus_slave_id_val, Serial1);
     
     // --- Call Custom Identity Function ---
     delay(500); 
-    fetchSensorIdentity(); // Bypasses library to send Func 0x2B with no manual flow control
+    fetchSensorIdentity(); 
 
     if (connected_to_wifi && modbusTcpEnabled) {
       modbusTCPServer.server(modbusTcpPort);
-      
       // 1. Add Live Metrics Registers (0-100)
       modbusTCPServer.addHreg(0, 0, 100); 
-
       // 2. Add Full Waveform Block (1000 - 14334)
-      // This allocates memory for the full waveform map
       modbusTCPServer.addHreg(HREG_WAVEFORM_START, 0, WAVEFORM_TOTAL_POINTS);
-
       // 3. Add Full Spectrum Block (20000 - 26145)
       modbusTCPServer.addHreg(HREG_SPECTRUM_START, 0, SPECTRUM_TOTAL_POINTS);
-
       logMessage("Modbus TCP: Map 1000->Waveform, 20000->Spectrum");
     }
     
     // 7. Setup Web Server
     server.on("/", HTTP_GET, handleRoot);
+    
+    // --- New Routes ---
+    server.on("/home", HTTP_GET, handleRoot);
+    server.on("/dashboard", HTTP_GET, handleRoot); 
+    // --------------------------
+    
     server.on("/data", HTTP_GET, handleMetrics);
     server.on("/fullwaveform", HTTP_GET, handleFullWaveform);
     server.on("/fullspectrum", HTTP_GET, handleFullSpectrum);
@@ -1611,15 +1641,17 @@ void setup() {
     server.on("/clear_dynamic_data", HTTP_GET, handleClearDynamicData);
     server.on("/reboot", HTTP_GET, handleReboot);
     server.on("/device_info", HTTP_GET, handleDeviceInfo);
-    server.on("/device_info_json", HTTP_GET, handleDeviceInfoJson); // NEW Route
     server.on("/modbustcp_settings", HTTP_GET, handleModbusTcpSettings);
     server.on("/save_modbustcp", HTTP_GET, handleSaveModbusTcp);
     server.on("/mqtt_status", HTTP_GET, handleMqttStatus); 
     server.on("/time_settings", HTTP_GET, handleTimeSettings); 
     server.on("/save_time", HTTP_GET, handleSaveTimeSettings); 
     server.on("/set_manual_time", HTTP_GET, handleSetManualTime); 
-    // NEW Handler
     server.on("/clear_system_log", HTTP_GET, handleClearSystemLog);
+    
+    // --- Upload Handler for Manual OTA ---
+    server.on("/update", HTTP_POST, handleUpdateResult, handleUpdateUpload);
+
     server.onNotFound(handleNotFound);
     
     server.begin();
@@ -1648,109 +1680,90 @@ void setup() {
     xTaskCreatePinnedToCore(backgroundLoop, "BackgroundTask", 16384, NULL, 1, NULL, 1);
 }
 
-void loop() { vTaskDelete(NULL); }
-
+void loop() { vTaskDelete(NULL); }// End of Part 1. Handlers are in Part 2. 
 // =================================================================
-// --- WEB SERVER HANDLERS
+// --- WEB SERVER HANDLERS (PART 2) - DASHBOARD & SETTINGS
 // =================================================================
 
 void handleRoot() {
-String html = R"rawliteral(
+    // We send the dashboard in one block because it is mostly static HTML.
+    // The browser fills in the data via Javascript fetching /data.
+    String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
     <title>Sensor Dashboard | )rawliteral" + sensor_model + R"rawliteral(</title>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/1.2.1/chartjs-plugin-zoom.min.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
-        :root { --primary-color: #007bff; --light-gray: #f8f9fa; --medium-gray: #e9ecef; --dark-gray: #495057; --text-color: #212529; }
+        :root { --primary-color: #007bff; --light-gray: #f8f9fa; --medium-gray: #e9ecef; --dark-gray: #495057; --text-color: #212529; --success-green: #28a745; --inactive-gray: #adb5bd; }
         body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f4f6f8; color: var(--text-color);}
+        
         .header{background-color:#2c3e50;color:white;padding:10px 20px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 2px 4px rgba(0,0,0,.1)}
         .title-container{display:flex;flex-direction:column;align-items:flex-start} .title{font-size:22px;font-weight:600} .subtitle{font-size:12px;color:#bdc3c7;font-weight:400}
         .header .menu a{color:white;text-decoration:none;font-size:15px;padding:8px 14px;border-radius:20px;margin-left:10px;border:1px solid #4a627a; display:inline-flex; align-items:center; gap: 6px;}
+        .header .time-container { text-align: center; }
         .header .time{font-size:14px;color:#bdc3c7}
-        .main-content{padding:20px}
+        
+        .main-content{padding:20px; max-width: 1200px; margin: 0 auto;}
         .tabs{display:flex;border-bottom:2px solid var(--medium-gray)}
         .tab-button{background:0 0;border:none;padding:15px 20px;font-size:16px;cursor:pointer;color:#6c757d;border-bottom:2px solid transparent}
         .tab-button.active{color:var(--primary-color);border-bottom:2px solid var(--primary-color);font-weight:700}
         .tab-content{display:none;padding-top:20px}.tab-content.active{display:block}
-        .chart-container{background-color:white;padding:20px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,.05);margin-bottom:20px}
-        .actions-panel{background-color:white;padding:20px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,.05);margin-bottom:20px}
-        .actions-panel h3 {margin-top:0;} .actions-panel p {margin-top:0; color:#6c757d; font-size: 14px;}
-        .actions-panel button, .actions-panel select{margin-right:10px;padding:8px 12px;font-size:14px;border:1px solid #ccc;border-radius:5px; display:inline-flex; align-items:center; gap:6px;}
-        .actions-panel .input-group { display: inline-flex; align-items: center; gap: 5px; margin-right: 15px; }
-        .actions-panel .input-group label { font-size: 14px; color: #333; }
-        button.btn-special { background-color: #28a745; color: white; border-color: #28a745; }
-        .footer{text-align:center;font-size:12px;color:#888;margin-top:20px;padding:10px;background-color:#fff;border-top:1px solid var(--medium-gray)}
-        #metrics-table{width:100%;border-collapse:collapse;background-color:white;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,.05);overflow:hidden;font-size:15px;}
-        #metrics-table th, #metrics-table td{padding:14px 18px;border-bottom:1px solid var(--medium-gray);}
+        
+        /* --- STATUS BOXES GRID --- */
+        .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }
+        .status-box { 
+            background: white; border: 2px solid var(--medium-gray); border-radius: 10px; padding: 20px; text-align: center; 
+            transition: all 0.3s ease; opacity: 0.6; box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .status-box .box-icon { margin-bottom: 10px; color: var(--inactive-gray); }
+        .status-box .box-label { font-size: 16px; font-weight: 700; color: var(--dark-gray); }
+        .status-box .box-value { font-size: 12px; color: #666; font-family: monospace; font-weight: 500; margin-top: 5px;}
+        
+        .status-box.active { 
+            border-color: var(--success-green); background-color: #f0fff4; opacity: 1; transform: translateY(-3px);
+            box-shadow: 0 8px 16px rgba(40, 167, 69, 0.15);
+        }
+        .status-box.active .box-icon { color: var(--success-green); }
+        .status-box.active .box-value { color: var(--success-green); font-weight: bold; background: white; padding: 2px 6px; border-radius: 4px; border: 1px solid #c3e6cb;}
+
+        /* --- DETAILED TABLE STYLES --- */
+        #metrics-table{width:100%;border-collapse:collapse;background-color:white;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,.05);overflow:hidden;font-size:14px;}
+        #metrics-table th, #metrics-table td{padding:10px 14px;border-bottom:1px solid var(--medium-gray);}
         #metrics-table thead th{background-color:var(--light-gray);font-weight:600;color:var(--dark-gray);text-align:left;}
         #metrics-table thead th:not(:first-child){text-align:right;}
-        #metrics-table tbody td:first-child{color:#343a40;}
-        #metrics-table tbody td:not(:first-child){text-align:right;font-weight:600;color:var(--primary-color);font-family:monospace, monospace;font-size:16px;}
+        #metrics-table tbody td:not(:first-child){text-align:right;font-weight:600;color:var(--primary-color);font-family:monospace;font-size:15px;}
         #metrics-table tbody tr:nth-child(even){background-color:var(--light-gray);}
-        #metrics-table tbody tr:hover{background-color:var(--medium-gray);}
-        #metrics-table .group-header th {background-color:var(--medium-gray);font-weight:bold;color:#343a40;padding:10px 18px;}
-        #metrics-table #temperature-cell {text-align:right !important;}
-        #progressBarContainer{width:100%;background-color:var(--medium-gray);border-radius:8px;overflow:hidden;margin-top:10px;margin-bottom:20px;display:none}
-        #progressBar{width:0%;height:24px;background-color:var(--primary-color);text-align:center;line-height:24px;color:white;font-weight:bold;transition:width .5s ease; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding: 0 10px;}
-        .chart-controls{display:flex;justify-content:space-between;align-items:center;padding:10px 0 0 0;margin-top:10px;border-top:1px solid #f0f0f0}
-        .chart-controls button { font-size: 12px; padding: 6px 10px; }
-        .chart-controls .timestamp { font-size: 12px; color: #6c757d; font-style: italic; }
-        .metrics-controls { background-color: white; padding: 15px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,.05); margin-bottom: 20px; display: flex; align-items: center; justify-content: flex-start; gap: 15px;}
-        .metrics-controls label { font-weight: 600; font-size: 15px; }
-        .metrics-controls select { font-size: 15px; }
-        .auto-capture-status { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; font-size: 14px; }
-        .auto-capture-status div { background-color: #f8f9fa; padding: 10px; border-radius: 6px; }
-        .auto-capture-status .label { font-weight: 600; color: #6c757d; display: block; margin-bottom: 4px;}
-        .auto-capture-status .value { font-weight: 700; color: var(--primary-color); font-family: monospace; }
-        #toast-notification { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 8px; padding: 16px; position: fixed; z-index: 10; left: 50%; transform: translateX(-50%); bottom: 30px; font-size: 16px; transition: visibility 0s, opacity 0.5s linear; opacity: 0;}
+        #metrics-table .group-header th {background-color:#e9ecef;font-weight:bold;color:#343a40;padding:8px 14px; text-transform: uppercase; font-size: 12px;}
+        
+        .actions-panel{background-color:white;padding:20px;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,.05);margin-bottom:20px}
+        .actions-panel h3 {margin-top:0; display:flex; align-items:center; gap: 8px; font-size: 18px;} 
+        .actions-panel p {margin-top:5px; margin-bottom: 15px; color:#6c757d; font-size: 14px;}
+        .actions-panel button, .actions-panel select{padding:8px 12px;font-size:14px;border:1px solid #ccc;border-radius:5px; cursor: pointer; margin-right: 10px;}
+        button.btn-special { background-color: #28a745; color: white; border-color: #28a745; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        
+        /* --- TRANSMISSION TAB STYLES --- */
+        .trans-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .trans-card { background: white; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,.05); overflow: hidden; }
+        .trans-header { background: #343a40; color: white; padding: 12px 15px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; }
+        .trans-body { padding: 20px; }
+        .status-row { display: flex; justify-content: space-between; border-bottom: 1px solid #eee; padding: 8px 0; font-size: 14px; }
+        .status-row:last-child { border-bottom: none; }
+        .status-val { font-weight: 600; font-family: monospace; color: #333; }
+        .json-preview { background: #2d3436; color: #55efc4; padding: 15px; border-radius: 6px; font-family: 'Courier New', monospace; font-size: 12px; height: 300px; overflow-y: auto; white-space: pre-wrap; margin-top: 15px; }
+        .reg-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+        .reg-table th { background: #f1f3f5; padding: 8px; text-align: left; border-bottom: 2px solid #ddd; }
+        .reg-table td { padding: 6px 8px; border-bottom: 1px solid #eee; font-family: monospace; }
+        
+        #progressBarContainer{width:100%;background-color:var(--medium-gray);border-radius:8px;overflow:hidden;margin:15px 0;display:none}
+        #progressBar{width:0%;height:24px;background-color:var(--primary-color);text-align:center;line-height:24px;color:white;font-weight:bold;transition:width .5s ease; white-space:nowrap;}
+        .footer{text-align:center;font-size:12px;color:#888;margin-top:20px;}
+        .badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 12px; font-weight: bold; }
+        
+        #toast-notification { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 8px; padding: 16px; position: fixed; z-index: 10; left: 50%; transform: translateX(-50%); bottom: 30px; font-size: 16px; opacity: 0; transition: opacity 0.5s; }
         #toast-notification.show { visibility: visible; opacity: 1; }
-        
-        /* --- Traffic Light Styles --- */
-        .traffic-light-wrapper {
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            gap: 15px;
-            margin-bottom: 15px;
-            padding: 8px 15px;
-            background: #f8f9fa;
-            border-radius: 8px;
-            border: 1px solid #e9ecef;
-        }
-        .traffic-label {
-            font-weight: bold;
-            font-size: 14px;
-            color: #495057;
-            margin-right: 10px;
-        }
-        .traffic-light {
-            display: flex;
-            gap: 8px;
-            background-color: #333;
-            padding: 8px;
-            border-radius: 20px;
-            border: 2px solid #555;
-        }
-        .bulb {
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background-color: #555; /* Off state */
-            transition: background-color 0.3s, box-shadow 0.3s;
-            border: 1px solid #222;
-        }
-        /* Active States */
-        .bulb.red.active { background-color: #ff4d4d; box-shadow: 0 0 10px #ff4d4d; }
-        .bulb.yellow.active { background-color: #ffcc00; box-shadow: 0 0 10px #ffcc00; }
-        .bulb.green.active { background-color: #33cc33; box-shadow: 0 0 10px #33cc33; }
-        
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        .animate-spin { animation: spin 1s linear infinite; }
     </style>
 </head>
 <body>
@@ -1759,41 +1772,49 @@ String html = R"rawliteral(
             <div class="title">)rawliteral" + sensor_model + R"rawliteral(</div>
             <div class="subtitle">Serial: )rawliteral" + sensor_serial + R"rawliteral(</div>
         </div>
-        <div class="time" id="clock">--:--:--</div>
+        <div class="time-container"><div class="time" id="clock">--:--:--</div></div>
         <div class="menu"><a href="/settings"><i data-lucide="settings"></i>Settings</a></div>
     </div>
+    
     <div class="main-content">
         <div class="tabs">
             <button class="tab-button active" onclick="openTab(event, 'Metrics')">Overall Metrics</button>
-            <button class="tab-button" onclick="openTab(event, 'Waveforms')">Waveform & Spectrum</button>
+            <button class="tab-button" onclick="openTab(event, 'Transmission')">Control & Transmission</button>
         </div>
 
         <div id="Metrics" class="tab-content active">
-            <div id="progressBarContainer"><div id="progressBar">0%</div></div>
-            <div class="metrics-controls">
-                <label for="metrics_interval">Live Update Rate:</label>
-                <select id="metrics_interval" onchange="setMetricsInterval()">
-                    <option value="2000">2 Seconds</option>
-                    <option value="5000">5 Seconds</option>
-                    <option value="10000">10 Seconds</option>
-                </select>
-            </div>
-            <table id="metrics-table">
+             <div id="progressBarContainer"><div id="progressBar">0%</div></div>
+             
+             <div class="actions-panel" style="display:flex; justify-content:space-between; align-items:center; padding:15px;">
+                <div>
+                    <strong>Live Update Rate:</strong>
+                    <select id="metrics_interval" onchange="setMetricsInterval()">
+                        <option value="1000">1 Second</option>
+                        <option value="2000">2 Seconds (Default)</option>
+                        <option value="5000">5 Seconds</option>
+                    </select>
+                </div>
+                <div>
+                    <button onclick="window.location.href='/download_metrics_csv'"><i data-lucide="download"></i> Download CSV Log</button>
+                </div>
+             </div>
+
+             <table id="metrics-table">
                 <thead><tr><th>Measurement</th><th>X-Axis</th><th>Y-Axis</th><th>Z-Axis</th></tr></thead>
                 
-                <tbody class="group-header"><tr class="group-header"><th colspan="4">Velocity (ISO 10-1k Hz)</th></tr></tbody>
+                <tbody class="group-header"><tr><th colspan="4">Velocity (ISO 10-1k Hz)</th></tr></tbody>
                 <tbody>
                     <tr><td>Peak (mm/s)</td><td id="veloPeakX">--</td><td id="veloPeakY">--</td><td id="veloPeakZ">--</td></tr>
                     <tr><td>RMS (mm/s)</td><td id="veloRmsX">--</td><td id="veloRmsY">--</td><td id="veloRmsZ">--</td></tr>
                 </tbody>
 
-                <tbody class="group-header"><tr class="group-header"><th colspan="4">Velocity Wide (10-5k Hz)</th></tr></tbody>
+                <tbody class="group-header"><tr><th colspan="4">Velocity Wide (10-5k Hz)</th></tr></tbody>
                 <tbody>
                     <tr><td>Peak (mm/s)</td><td id="veloWidePeakX">--</td><td id="veloWidePeakY">--</td><td id="veloWidePeakZ">--</td></tr>
                     <tr><td>RMS (mm/s)</td><td id="veloWideRmsX">--</td><td id="veloWideRmsY">--</td><td id="veloWideRmsZ">--</td></tr>
                 </tbody>
 
-                <tbody class="group-header"><tr class="group-header"><th colspan="4">Acceleration (g)</th></tr></tbody>
+                <tbody class="group-header"><tr><th colspan="4">Acceleration (g)</th></tr></tbody>
                 <tbody>
                     <tr><td>RMS (2-1k Hz)</td><td id="accelRmsX">--</td><td id="accelRmsY">--</td><td id="accelRmsZ">--</td></tr>
                     <tr><td>Peak (2-1k Hz)</td><td id="accelPeakX">--</td><td id="accelPeakY">--</td><td id="accelPeakZ">--</td></tr>
@@ -1801,7 +1822,7 @@ String html = R"rawliteral(
                     <tr><td>Peak (10-5k Hz)</td><td id="accelPeak2X">--</td><td id="accelPeak2Y">--</td><td id="accelPeak2Z">--</td></tr>
                 </tbody>
 
-                <tbody class="group-header"><tr class="group-header"><th colspan="4">Acceleration Metric (m/s&sup2;)</th></tr></tbody>
+                <tbody class="group-header"><tr><th colspan="4">Acceleration Metric (m/s&sup2;)</th></tr></tbody>
                 <tbody>
                     <tr><td>RMS (2-1k Hz)</td><td id="accelMetricRmsX">--</td><td id="accelMetricRmsY">--</td><td id="accelMetricRmsZ">--</td></tr>
                     <tr><td>Peak (2-1k Hz)</td><td id="accelMetricPeakX">--</td><td id="accelMetricPeakY">--</td><td id="accelMetricPeakZ">--</td></tr>
@@ -1809,7 +1830,7 @@ String html = R"rawliteral(
                     <tr><td>Peak (10-5k Hz)</td><td id="accelMetricPeak2X">--</td><td id="accelMetricPeak2Y">--</td><td id="accelMetricPeak2Z">--</td></tr>
                 </tbody>
 
-                <tbody class="group-header"><tr class="group-header"><th colspan="4">Displacement (&micro;m)</th></tr></tbody>
+                <tbody class="group-header"><tr><th colspan="4">Displacement (&micro;m)</th></tr></tbody>
                 <tbody>
                     <tr><td>RMS (10-1k Hz)</td><td id="displRmsX">--</td><td id="displRmsY">--</td><td id="displRmsZ">--</td></tr>
                     <tr><td>Peak (10-1k Hz)</td><td id="displPeakX">--</td><td id="displPeakY">--</td><td id="displPeakZ">--</td></tr>
@@ -1817,149 +1838,119 @@ String html = R"rawliteral(
                     <tr><td>Peak (2-1k Hz)</td><td id="displLowPeakX">--</td><td id="displLowPeakY">--</td><td id="displLowPeakZ">--</td></tr>
                 </tbody>
                 
-                <tbody class="group-header"><tr class="group-header"><th colspan="4">Overall & Temperature</th></tr></tbody>
+                <tbody class="group-header"><tr><th colspan="4">Overall & Temperature</th></tr></tbody>
                 <tbody>
                     <tr><td>True Peak (g)</td><td id="truePeakX">--</td><td id="truePeakY">--</td><td id="truePeakZ">--</td></tr>
                     <tr><td>Crest Factor</td><td id="crestFactorX">--</td><td id="crestFactorY">--</td><td id="crestFactorZ">--</td></tr>
-                    <tr><td>Temperature (&deg;C)</td><td colspan="3" id="temperature-cell">--</td></tr>
+                    <tr><td>Std Deviation</td><td id="stdDeviationX">--</td><td id="stdDeviationY">--</td><td id="stdDeviationZ">--</td></tr>
+                    <tr><td>Temperature (&deg;C)</td><td colspan="3" id="temperature-cell" style="text-align:right">--</td></tr>
                 </tbody>
             </table>
         </div>
 
-        <div id="Waveforms" class="tab-content">
+        <div id="Transmission" class="tab-content">
+            
             <div class="actions-panel">
-                
-                <div class="traffic-light-wrapper">
-                    <span class="traffic-label" id="tl-status-text">Sensor Status: IDLE</span>
-                    <div class="traffic-light">
-                        <div id="bulb-red" class="bulb red active"></div>
-                        <div id="bulb-yellow" class="bulb yellow"></div>
-                        <div id="bulb-green" class="bulb green"></div>
+                <h3><i data-lucide="hard-drive"></i> Data Buffer Status</h3>
+                <div class="status-grid">
+                    <div id="box-x" class="status-box">
+                        <div class="box-icon"><i data-lucide="activity"></i></div>
+                        <div class="box-label">X-AXIS</div>
+                        <div class="box-value">EMPTY</div>
+                    </div>
+                    <div id="box-y" class="status-box">
+                        <div class="box-icon"><i data-lucide="activity"></i></div>
+                        <div class="box-label">Y-AXIS</div>
+                        <div class="box-value">EMPTY</div>
+                    </div>
+                    <div id="box-z" class="status-box">
+                        <div class="box-icon"><i data-lucide="activity"></i></div>
+                        <div class="box-label">Z-AXIS</div>
+                        <div class="box-value">EMPTY</div>
                     </div>
                 </div>
+            </div>
 
-                <h3><i data-lucide="scan-line"></i> Manual Data Collection</h3>
-                <p>Select an axis and graph resolution, then start the capture.</p>
-                <div class="input-group">
-                    <label for="manual_axis_select">Axis:</label>
-                    <select id="manual_axis_select">
+            <div class="actions-panel">
+                <h3><i data-lucide="scan-line"></i> Control Panel</h3>
+                <p>Trigger a capture to populate the buffer and send via MQTT/Modbus.</p>
+                <div style="display:flex; gap:15px; flex-wrap:wrap; align-items:center; background: #f8f9fa; padding: 15px; border-radius: 8px;">
+                    <select id="manual_axis_select" style="min-width: 120px;">
                         <option value="X">X-Axis</option>
                         <option value="Y">Y-Axis</option>
                         <option value="Z">Z-Axis</option>
                     </select>
+                    <button id="collectSingleBtn" onclick="triggerManualCapture()"><i data-lucide="scan-search"></i>Capture Selected</button>
+                    <div style="width:1px; height:30px; background:#ccc; margin:0 10px;"></div>
+                    <button id="collectAllBtn" class="btn-special" onclick="triggerAll()"><i data-lucide="scan"></i>Capture All (XYZ Cycle)</button>
                 </div>
-                <div class="input-group">
-                    <label for="wf_resolution">Waveform Res:</label>
-                    <select id="wf_resolution" onchange="setWfResolution()">
-                        <option value="800">Standard (800 pts)</option>
-                        <option value="400">Low (400 pts)</option>
-                        <option value="2000">High (2000 pts)</option>
-                        <option value="13334">Full (13334 pts)</option>
+                
+                <div style="margin-top: 15px; border-top: 1px dashed #ccc; padding-top: 10px;">
+                    <label><strong>Auto-Capture Interval (MQTT):</strong></label>
+                    <select id="data_interval" onchange="setIntervals()">
+                        <option value="300000">5 Minutes</option>
+                        <option value="600000">10 Minutes</option>
+                        <option value="1800000">30 Minutes</option>
+                        <option value="3600000">1 Hour</option>
+                        <option value="2147483647">Never (Manual Only)</option>
                     </select>
-                </div>
-                <div class="input-group">
-                    <label for="sp_resolution">Spectrum Res:</label>
-                        <select id="sp_resolution" onchange="setSpResolution()">
-                        <option value="500">Standard (500 pts)</option>
-                        <option value="1000">High (1000 pts)</option>
-                        <option value="3000">Very High (3000 pts)</option>
-                        <option value="6145">Full (6145 pts)</option>
-                    </select>
-                </div>
-                <br><br>
-                <button id="collectSingleBtn" onclick="triggerManualCapture()"><i data-lucide="scan-search"></i>Collect Selected Axis</button>
-                <button id="collectAllBtn" class="btn-special" onclick="triggerAll()"><i data-lucide="scan"></i>Collect All XYZ</button>
-            </div>
-            
-            <div class="actions-panel">
-                <h3><i data-lucide="timer"></i> Automatic Data Collection</h3>
-                <p>The device will automatically cycle through all axes (XYZ) and send to MQTT at the selected interval.</p>
-                <select id="data_interval" onchange="setIntervals()">
-                    <option value="300000">5 Minutes</option>
-                    <option value="600000">10 Minutes</option>
-                    <option value="1800000">30 Minutes</option>
-                    <option value="3600000">1 Hour</option>
-                    <option value="2147483647">Never (Manual Only)</option>
-                </select>
-                <div class="auto-capture-status" style="margin-top: 15px;">
-                    <div><span class="label">Last Sent (All Axes)</span><span class="value" id="lastSent">--</span></div>
-                    <div><span class="label">Next Capture In</span><span class="value" id="nextCapture">--</span></div>
                 </div>
             </div>
 
-            <div class="chart-container">
-                <canvas id="waveformChart"></canvas>
-                <div class="chart-controls">
-                    <button id="reloadWfBtn" disabled>No Data Captured</button>
-                    <button id="zoomWfBtn">Enable Zoom</button>
+            <div class="trans-grid">
+                <div class="trans-card">
+                    <div class="trans-header">
+                        <span><i data-lucide="cloud"></i> MQTT Protocol</span>
+                        <span id="mqtt-badge" class="badge" style="background:#dc3545;">Disconnected</span>
+                    </div>
+                    <div class="trans-body">
+                        <div class="status-row"><span>Broker Address:</span><span class="status-val" id="mqtt-broker">--</span></div>
+                        <div class="status-row"><span>Target Topic:</span><span class="status-val" id="mqtt-topic">--</span></div>
+                        <div class="status-row"><span>Last Status:</span><span class="status-val" id="mqtt-msg">Waiting...</span></div>
+                        
+                        <div style="margin-top:15px; font-size:12px; font-weight:600; color:#666;">LIVE DATA PREVIEW (JSON):</div>
+                        <div class="json-preview" id="mqtt-preview">Waiting for data...</div>
+                    </div>
                 </div>
-            </div>
-            <div class="chart-container">
-                <canvas id="spectrumChart"></canvas>
-                <div class="chart-controls">
-                    <button id="reloadSpBtn" disabled>No Data Captured</button>
-                    <button id="zoomSpBtn">Enable Zoom</button>
+
+                <div class="trans-card">
+                    <div class="trans-header">
+                        <span><i data-lucide="server"></i> Modbus TCP Server</span>
+                        <span id="modbus-badge" class="badge" style="background:#ccc;">Checking...</span>
+                    </div>
+                    <div class="trans-body">
+                        <div class="status-row"><span>Server Port:</span><span class="status-val" id="modbus-port">--</span></div>
+                        <div class="status-row"><span>Slave ID:</span><span class="status-val" id="modbus-id">--</span></div>
+                        <div class="status-row"><span>Holding Registers:</span><span class="status-val">Available</span></div>
+
+                        <div style="margin-top:15px; font-size:12px; font-weight:600; color:#666;">REGISTER MAP GUIDE:</div>
+                        <table class="reg-table">
+                            <thead><tr><th>Address</th><th>Data Content</th><th>Scale</th></tr></thead>
+                            <tbody>
+                                <tr><td>0 - 60</td><td>Live Overall Metrics</td><td>Mixed</td></tr>
+                                <tr><td>80 - 93</td><td>Control & Status Flags</td><td>Int16</td></tr>
+                                <tr><td>1000+</td><td>Waveform Data Blocks</td><td>x0.001 g</td></tr>
+                                <tr><td>20000+</td><td>Spectrum Data Blocks</td><td>x0.001 g</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
-    <div class="footer"><span id="status">Status: Initializing...</span> | Last Metrics Update: <span id="lastUpdated">--</span></div>
+    <div class="footer"><span id="status">Status: Initializing...</span></div>
     <div id="toast-notification">Notification</div>
     
     <script>
-        let waveformChart, spectrumChart;
+        let dashboardUpdateInterval;
         let wasCapturing = false;
-        let MAX_WF_POINTS = 800;
-        let MAX_SP_POINTS = 500;
-        let dashboardUpdateInterval, countdownInterval;
-        let nextCaptureTimeMillis = 0;
         let isFullCycle = false;
-        
-        let deviceUptimeMillis = 0; 
-        setInterval(() => { deviceUptimeMillis += 1000; updateCountdown(); }, 1000);
 
-        let lastLoadedData = {
-            axis: null,
-            timestamp: null,
-            wfData: null,
-            spData: null
-        };
-        
         function showToast(message) {
             const toast = document.getElementById("toast-notification");
             toast.textContent = message;
             toast.className = "show";
             setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 3000);
-        }
-
-        function setMetricsInterval() {
-            const interval = document.getElementById('metrics_interval').value;
-            fetch(`/set_metrics_interval?interval=${interval}`)
-                .then(response => {
-                    if(response.ok) {
-                        showToast(`Core sensor polling rate updated to ${interval/1000} seconds.`);
-                        if(dashboardUpdateInterval) clearInterval(dashboardUpdateInterval);
-                        dashboardUpdateInterval = setInterval(updateDashboardData, interval);
-                    }
-                });
-        }
-        
-        function setWfResolution() {
-            const resolution = document.getElementById('wf_resolution').value;
-            MAX_WF_POINTS = parseInt(resolution, 10);
-            showToast(`Waveform resolution set to ${resolution} points.`);
-            if (MAX_WF_POINTS > 8000) {
-                setTimeout(() => { showToast("Warning: Full resolution may be slow to render."); }, 1000);
-            }
-        }
-        
-        function setSpResolution() {
-            const resolution = document.getElementById('sp_resolution').value;
-            MAX_SP_POINTS = parseInt(resolution, 10);
-            showToast(`Spectrum resolution set to ${resolution} points.`);
-            if (MAX_SP_POINTS > 3000) {
-                setTimeout(() => { showToast("Warning: Full resolution may be slow to render."); }, 1000);
-            }
         }
 
         function openTab(evt, tabName) {
@@ -1973,107 +1964,67 @@ String html = R"rawliteral(
         
         function updateClock() { document.getElementById('clock').textContent = new Date().toLocaleTimeString(); }
 
-        function setIntervals() { 
-            fetch(`/set_intervals?interval=${document.getElementById('data_interval').value}`)
-                .then(() => showToast('Automatic capture interval updated!')); 
-        }
-
-        function clearCharts() {
-            [waveformChart, spectrumChart].forEach(chart => {
-                if (chart) {
-                    chart.data.datasets.forEach(dataset => {
-                        dataset.data = [];
-                    });
-                    chart.update('none');
+        function setMetricsInterval() {
+            const interval = document.getElementById('metrics_interval').value;
+            fetch(`/set_metrics_interval?interval=${interval}`).then(r => {
+                if(r.ok) { 
+                    showToast("Live update rate set to " + interval/1000 + "s"); 
+                    clearInterval(dashboardUpdateInterval);
+                    dashboardUpdateInterval = setInterval(updateDashboardData, interval);
                 }
             });
-            console.log("All charts cleared for new collection cycle.");
         }
-        
+
+        function setIntervals() { 
+            const val = document.getElementById('data_interval').value;
+            fetch(`/set_intervals?interval=${val}`).then(() => showToast('Auto-Capture Interval Updated!')); 
+        }
+
         function trigger(axis, isCycle = false) {
             fetch('/trigger_capture?axis=' + axis + '&cycle=' + isCycle)
-                .then(() => console.log('Capture triggered for ' + axis + '-Axis. Cycling: ' + isCycle));
+                .then(() => console.log('Capture triggered for ' + axis + '-Axis'));
         }
         
         function triggerManualCapture() {
-            const collectSingleBtn = document.getElementById('collectSingleBtn');
-            collectSingleBtn.disabled = true;
-            collectSingleBtn.innerHTML = '<i data-lucide="loader-2" class="animate-spin"></i> Collecting...';
-            lucide.createIcons();
-
             const selectedAxis = document.getElementById('manual_axis_select').value;
-            const axisIndex = ['X', 'Y', 'Z'].indexOf(selectedAxis);
-            if (axisIndex === -1) return;
-
             isFullCycle = false;
-
-            waveformChart.data.datasets[axisIndex].data = [];
-            spectrumChart.data.datasets[axisIndex].data = [];
-            spectrumChart.data.datasets[axisIndex + 3].data = []; // Clear peaks too
-            waveformChart.update('none');
-            spectrumChart.update('none');
-            showToast(`Starting new capture for ${selectedAxis}-Axis...`);
-            
+            showToast(`Requesting ${selectedAxis}-Axis Capture...`);
             trigger(selectedAxis, false);
         }
 
         function triggerAll() {
-            const collectAllBtn = document.getElementById('collectAllBtn');
-            collectAllBtn.disabled = true;
-            collectAllBtn.innerHTML = '<i data-lucide="loader-2" class="animate-spin"></i> Collecting...';
-            lucide.createIcons();
-
-            showToast('Starting full XYZ capture cycle...');
+            showToast('Starting XYZ Cycle...');
             isFullCycle = true;
-            clearCharts(); 
-            trigger('X', true); // Pass 'true' for the first axis in the cycle
+            trigger('X', true); 
         }
-        
-        function downsampleData(data, labels, maxPoints) {
-            if (data.length <= maxPoints) { return {data, labels}; }
-            const downsampledData = [];
-            const downsampledLabels = [];
-            const step = Math.floor(data.length / maxPoints);
-            for (let i = 0; i < data.length; i += step) {
-                downsampledData.push(data[i]);
-                downsampledLabels.push(labels[i]);
+
+        function updateStatusBoxes(capturedAxis) {
+            ['x', 'y', 'z'].forEach(axis => {
+                const box = document.getElementById('box-' + axis);
+                if(box) {
+                    box.classList.remove('active');
+                    box.querySelector('.box-value').textContent = "EMPTY";
+                }
+            });
+            if (capturedAxis && capturedAxis !== 'NONE') {
+                const activeBox = document.getElementById('box-' + capturedAxis.toLowerCase());
+                if (activeBox) {
+                    activeBox.classList.add('active');
+                    activeBox.querySelector('.box-value').textContent = "DATA IN MEMORY";
+                }
             }
-            return {data: downsampledData, labels: downsampledLabels};
         }
         
         function updateDashboardData() {
-            fetch("/data").then(r => r.json()).then(data => {
+            fetch("/data")
+            .then(r => r.json())
+            .then(data => {
                 const statusText = data.status || "Monitoring";
                 const isCapturing = statusText.toLowerCase().includes('collecting') || statusText.toLowerCase().includes('waiting') || statusText.toLowerCase().includes('requesting') || statusText.toLowerCase().includes('downloading');
                 
                 document.getElementById('status').textContent = 'Status: ' + statusText;
                 
-                // --- Traffic Light Logic ---
-                const tlStatus = data.traffic_light || "IDLE"; 
-                const statusLabel = document.getElementById('tl-status-text');
-                const bRed = document.getElementById('bulb-red');
-                const bYellow = document.getElementById('bulb-yellow');
-                const bGreen = document.getElementById('bulb-green');
-
-                // Reset
-                bRed.classList.remove('active');
-                bYellow.classList.remove('active');
-                bGreen.classList.remove('active');
-                statusLabel.textContent = "Sensor Status: " + tlStatus;
-
-                // Toggle Lights
-                if (tlStatus === "IDLE" || tlStatus === "ERROR") {
-                    bRed.classList.add('active'); // Red ON
-                } 
-                else if (tlStatus === "TRIGGERED" || tlStatus === "BUSY") {
-                    bYellow.classList.add('active'); // Yellow ON
-                    statusLabel.textContent = (tlStatus === "TRIGGERED") ? "Sensor Status: CALC..." : "Sensor Status: " + tlStatus;
-                } 
-                else if (tlStatus === "READY") {
-                    bGreen.classList.add('active'); // Green ON
-                }
-                // --- End Traffic Light ---
-
+                // Progress Bar
                 const progressBarContainer = document.getElementById('progressBarContainer');
                 const progressBar = document.getElementById('progressBar');
                 if (isCapturing) {
@@ -2086,255 +2037,103 @@ String html = R"rawliteral(
                     progressBarContainer.style.display = 'none';
                 }
 
-                if (!isCapturing) {
-                    const metricsToUpdate = [
-                        'veloPeak', 'veloRms', 'accelPeak', 'accelRms', 'accelPeak2', 'accelRms2', 'displPeak', 'displRms', 'truePeak', 'crestFactor',
-                        'accelMetricRms', 'accelMetricPeak', 'accelMetricRms2', 'accelMetricPeak2',
-                        'veloWideRms', 'veloWidePeak', 'displLowRms', 'displLowPeak'
+                updateStatusBoxes(data.capturedAxis);
+
+                // --- UPDATE METRICS TABLE (FULL LIST) ---
+                try {
+                    const metrics = [
+                        'veloPeak', 'veloRms', 
+                        'veloWidePeak', 'veloWideRms',
+                        'accelPeak', 'accelRms', 
+                        'accelPeak2', 'accelRms2', 
+                        'accelMetricPeak', 'accelMetricRms',
+                        'accelMetricPeak2', 'accelMetricRms2',
+                        'displPeak', 'displRms',
+                        'displLowPeak', 'displLowRms',
+                        'truePeak', 'crestFactor', 'stdDeviation'
                     ];
-                    metricsToUpdate.forEach(metric => {
-                        if (data[metric]) {
-                            document.getElementById(metric + 'X').textContent = data[metric].x.toFixed(3);
-                            document.getElementById(metric + 'Y').textContent = data[metric].y.toFixed(3);
-                            document.getElementById(metric + 'Z').textContent = data[metric].z.toFixed(3);
-                        }
-                    });
-                    document.getElementById('temperature-cell').textContent = data.temperature.toFixed(2);
-                    document.getElementById('lastUpdated').innerHTML = new Date().toLocaleTimeString();
-                }
 
-                if (wasCapturing && !isCapturing && data.capturedAxis && data.capturedAxis !== 'NONE') {
-                    loadFullDataForAxis(data.capturedAxis);
-                }
-                wasCapturing = isCapturing;
+                    if (data.accelRms) {
+                        metrics.forEach(k => {
+                            if(data[k]) {
+                                const elX = document.getElementById(k+'X');
+                                const elY = document.getElementById(k+'Y');
+                                const elZ = document.getElementById(k+'Z');
+                                if(elX) elX.textContent = data[k].x.toFixed(3);
+                                if(elY) elY.textContent = data[k].y.toFixed(3);
+                                if(elZ) elZ.textContent = data[k].z.toFixed(3);
+                            }
+                        });
+                        document.getElementById('temperature-cell').textContent = data.temperature.toFixed(2);
+                    }
+                } catch(e) { console.error("Error updating table:", e); }
 
-                deviceUptimeMillis = data.uptimeMillis;
-                document.getElementById('lastSent').textContent = data.lastAutoCaptureTimestamp.replace("T", " ").substring(0, 19);
-                if(data.interval < 2147483647) {
-                    nextCaptureTimeMillis = data.lastAutoCaptureMillis + data.interval;
+                // --- UPDATE TRANSMISSION TAB ---
+                // MQTT
+                const mqttBadge = document.getElementById('mqtt-badge');
+                if(data.mqtt_connected) {
+                    mqttBadge.textContent = "CONNECTED";
+                    mqttBadge.style.background = "#28a745";
                 } else {
-                    nextCaptureTimeMillis = 0;
+                    mqttBadge.textContent = "DISCONNECTED";
+                    mqttBadge.style.background = "#dc3545";
                 }
-            });
-        }
-        
-        function updateCountdown() {
-            if (nextCaptureTimeMillis === 0) {
-                document.getElementById('nextCapture').textContent = "Never";
-                return;
-            }
-            const remainingMs = nextCaptureTimeMillis - deviceUptimeMillis;
-            if (remainingMs <= 0) {
-                document.getElementById('nextCapture').textContent = "Due now...";
-                return;
-            }
-            const totalSeconds = Math.floor(remainingMs / 1000);
-            const hours = Math.floor(totalSeconds / 3600);
-            const minutes = Math.floor((totalSeconds % 3600) / 60);
-            const seconds = totalSeconds % 60;
-            document.getElementById('nextCapture').textContent = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-        }
-
-
-        function findPeaks(data, labels, count) {
-            if (!data || data.length === 0) return [];
-            const peaks = data.map((y, i) => ({x: labels[i], y: y}))
-                .sort((a, b) => b.y - a.y)
-                .slice(0, count);
-            return peaks;
-        }
-        
-        async function loadFullDataForAxis(axis) {
-            const axisIndex = ['X', 'Y', 'Z'].indexOf(axis);
-            if (axisIndex === -1) return;
-            
-            try {
-                const wfResponse = await fetch('/fullwaveform');
-                const wfData = await wfResponse.json();
-                lastLoadedData.wfData = wfData;
-
-                if (wfData && wfData.length > 0) {
-                    const totalSeconds = 1.0;
-                    const timeLabels = wfData.map((_, i) => (i / wfData.length) * totalSeconds);
-                    const { data: downsampledData, labels: downsampledLabels } = downsampleData(wfData, timeLabels, MAX_WF_POINTS);
-                    
-                    waveformChart.data.labels = downsampledLabels;
-                    waveformChart.data.datasets[axisIndex].data = downsampledData;
-                    waveformChart.update('none');
+                
+                document.getElementById('mqtt-broker').textContent = data.mqtt_server || "Unknown";
+                document.getElementById('mqtt-topic').textContent = data.mqtt_topic || "Unknown";
+                document.getElementById('mqtt-msg').textContent = data.status;
+                
+                if(data.accelRms) {
+                    const previewData = {
+                        timestamp: new Date().toISOString(),
+                        model: ")rawliteral" + sensor_model + R"rawliteral(",
+                        type: "metrics",
+                        data: {
+                            accel: data.accelRms,
+                            velo: data.veloRms,
+                            temp: data.temperature
+                        }
+                    };
+                    document.getElementById('mqtt-preview').textContent = JSON.stringify(previewData, null, 2);
                 }
-            } catch (error) { console.error('Error loading waveform:', error); }
 
-            try {
-                const spResponse = await fetch('/fullspectrum');
-                const spData = await spResponse.json();
-                lastLoadedData.spData = spData;
-
-                if (spData && spData.points && spData.points.length > 0) {
-                    const { data: downsampledPoints, labels: downsampledLabels } = downsampleData(spData.points, spData.labels, MAX_SP_POINTS);
-
-                    spectrumChart.data.labels = downsampledLabels;
-                    spectrumChart.data.datasets[axisIndex].data = downsampledPoints;
-                    
-                    const peaks = findPeaks(downsampledPoints, downsampledLabels, 5);
-                    spectrumChart.data.datasets[axisIndex + 3].data = peaks;
-
-                    spectrumChart.update('none');
+                // Modbus
+                const mbBadge = document.getElementById('modbus-badge');
+                if(data.modbus_enabled) {
+                    mbBadge.textContent = "RUNNING";
+                    mbBadge.style.background = "#28a745";
+                } else {
+                    mbBadge.textContent = "DISABLED";
+                    mbBadge.style.background = "#6c757d";
                 }
-            } catch (error) { console.error('Error loading spectrum:', error); }
+                document.getElementById('modbus-port').textContent = data.modbus_port || "502";
+                document.getElementById('modbus-id').textContent = data.modbus_id || "1";
 
-            lastLoadedData.axis = axis;
-            lastLoadedData.timestamp = new Date();
-            updateReloadButtons();
-            
-            if (isFullCycle) {
-                if (axis === 'X') {
-                    showToast('X-Axis loaded. Starting Y-Axis capture...');
-                    setTimeout(() => trigger('Y', true), 1000); // Pass 'true' to continue cycle
-                } else if (axis === 'Y') {
-                    showToast('Y-Axis loaded. Starting Z-Axis capture...');
-                    setTimeout(() => trigger('Z', true), 1000); // Pass 'true' to continue cycle
-                } else if (axis === 'Z') {
-                    showToast('Full XYZ capture cycle complete!');
-                    isFullCycle = false;
-                    const collectAllBtn = document.getElementById('collectAllBtn');
-                    collectAllBtn.disabled = false;
-                    collectAllBtn.innerHTML = '<i data-lucide="scan"></i>Collect All XYZ';
-                    lucide.createIcons();
+                // Cycle Logic
+                if (wasCapturing && !isCapturing && isFullCycle && data.capturedAxis) {
+                   if (data.capturedAxis === 'X') { setTimeout(() => trigger('Y', true), 1000); }
+                   else if (data.capturedAxis === 'Y') { setTimeout(() => trigger('Z', true), 1000); }
+                   else if (data.capturedAxis === 'Z') { isFullCycle = false; showToast("XYZ Cycle Complete"); }
                 }
-            } else {
-                const collectSingleBtn = document.getElementById('collectSingleBtn');
-                collectSingleBtn.disabled = false;
-                collectSingleBtn.innerHTML = '<i data-lucide="scan-search"></i>Collect Selected Axis';
-                lucide.createIcons();
-            }
+                
+                wasCapturing = isCapturing;
+            })
+            .catch(err => console.log("Fetch error (normal if booting):", err));
         }
 
-        function updateReloadButtons() {
-            if(lastLoadedData.axis) {
-                const time = lastLoadedData.timestamp.toLocaleTimeString();
-                const btnText = `Reload ${lastLoadedData.axis}-Axis @ ${time}`;
-                document.getElementById('reloadWfBtn').textContent = btnText;
-                document.getElementById('reloadSpBtn').textContent = btnText;
-                document.getElementById('reloadWfBtn').disabled = false;
-                document.getElementById('reloadSpBtn').disabled = false;
-            }
-        }
-
-        function reloadLastDataToCharts() {
-            if (!lastLoadedData.axis) return;
-            showToast(`Reloaded cached ${lastLoadedData.axis}-Axis data.`);
-        }
-        
         window.onload = function() {
-            lucide.createIcons();
-
-            fetch('/get_intervals').then(r => r.json()).then(d => { 
-                document.getElementById('data_interval').value = d.interval; 
+            if (typeof lucide !== 'undefined') lucide.createIcons();
+            
+            // Get initial interval settings
+            fetch('/get_intervals').then(r => r.json()).then(d => {
                 document.getElementById('metrics_interval').value = d.metrics_interval;
-                if(dashboardUpdateInterval) clearInterval(dashboardUpdateInterval);
+                document.getElementById('data_interval').value = d.interval;
                 dashboardUpdateInterval = setInterval(updateDashboardData, d.metrics_interval);
             });
 
-            fetch("/data").then(r => r.json()).then(data => {
-                if (data.newWaveformAvailable && data.capturedAxis && data.capturedAxis !== 'NONE') {
-                    console.log('Previous data found on device. Loading it into charts...');
-                    showToast(`Restoring previous capture for ${data.capturedAxis}-Axis...`);
-                    document.querySelector('button[onclick="openTab(event, \'Waveforms\')"]').click();
-                    loadFullDataForAxis(data.capturedAxis);
-                }
-            });
-
-            document.getElementById('reloadWfBtn').addEventListener('click', reloadLastDataToCharts);
-            document.getElementById('reloadSpBtn').addEventListener('click', reloadLastDataToCharts);
-            
-            document.getElementById('zoomWfBtn').addEventListener('click', (e) => toggleZoom(waveformChart, e.target));
-            document.getElementById('zoomSpBtn').addEventListener('click', (e) => toggleZoom(spectrumChart, e.target));
-
-            function toggleZoom(chart, button) {
-                const zoomOptions = chart.options.plugins.zoom.zoom;
-                const panOptions = chart.options.plugins.zoom.pan;
-                const isEnabled = zoomOptions.wheel.enabled;
-                
-                zoomOptions.wheel.enabled = !isEnabled;
-                zoomOptions.pinch.enabled = !isEnabled;
-                panOptions.enabled = !isEnabled;
-
-                button.textContent = !isEnabled ? 'Disable Zoom' : 'Enable Zoom';
-                showToast(`Zoom ${!isEnabled ? 'Enabled' : 'Disabled'} for chart. Double-click to reset.`);
-                chart.update();
-            }
-
-            const axisConfigs = [
-                { label: 'X-Axis', color: 'rgb(255, 99, 132)' }, 
-                { label: 'Y-Axis', color: 'rgb(54, 162, 235)' }, 
-                { label: 'Z-Axis', color: 'rgb(75, 192, 192)' }
-            ];
-
-            const wfCtx = document.getElementById('waveformChart').getContext('2d');
-            waveformChart = new Chart(wfCtx, {
-                type: 'line', 
-                data: { labels: [], datasets: axisConfigs.map(cfg => ({ label: cfg.label, data: [], borderColor: cfg.color, borderWidth: 1.5, pointRadius: 0 })) },
-                options: { 
-                    interaction: {
-                        mode: 'index',
-                        intersect: false,
-                    },
-                    animation: false, 
-                    plugins: { 
-                        title: { display: true, text: 'Time Waveform' }, 
-                        zoom: { pan: { enabled: false, mode: 'x'}, zoom: { wheel: { enabled: false }, pinch: { enabled: false }, mode: 'x' } }, 
-                        tooltip: { callbacks: { title: (ctx) => `Time: ${ctx[0].label.toFixed(4)} s`, label: (ctx) => `  ${ctx.dataset.label}: ${ctx.raw.toFixed(4)} g` } } 
-                    }, 
-                    scales: { 
-                        y: { title: { display: true, text: 'Acceleration (g)' } }, 
-                        x: { type: 'linear', title: { display: true, text: 'Time (s)' } } 
-                    }, 
-                    onDoubleClick: (e) => { e.chart.resetZoom(); }
-                }
-            });
-
-            const spCtx = document.getElementById('spectrumChart').getContext('2d');
-            spectrumChart = new Chart(spCtx, {
-                type: 'line', 
-                data: { labels: [], datasets: [ ...axisConfigs.map(cfg => ({ label: cfg.label, data: [], borderColor: cfg.color, borderWidth: 1.5, pointRadius: 0, fill: false })), ...axisConfigs.map(cfg => ({ label: `${cfg.label} Peaks`, data: [], type: 'scatter', backgroundColor: cfg.color, pointRadius: 5, pointHoverRadius: 7 })) ] },
-                options: { 
-                    interaction: {
-                        mode: 'index',
-                        intersect: false,
-                    },
-                    animation: false, 
-                    plugins: { 
-                        title: { display: true, text: 'Frequency Spectrum' }, 
-                        zoom: { pan: { enabled: false, mode: 'x'}, zoom: { wheel: { enabled: false }, pinch: { enabled: false }, mode: 'x' } }, 
-                        tooltip: {
-                            callbacks: {
-                                title: (tooltipItems) => {
-                                    if (!tooltipItems.length) return '';
-                                    const freq = tooltipItems[0].parsed.x;
-                                    return `Frequency: ${freq.toFixed(2)} Hz`;
-                                },
-                                label: (context) => {
-                                    let label = context.dataset.label.replace(' Peaks', '');
-                                    let value = context.parsed.y;
-                                    if (value !== null) {
-                                        return ` ${label}: ${value.toFixed(4)} g`;
-                                    }
-                                    return ` ${label}: N/A`;
-                                }
-                            }
-                        } 
-                    }, 
-                    scales: { 
-                        y: { title: { display: true, text: 'Amplitude (g)' }, min: 0 }, 
-                        x: { type: 'linear', title: { display: true, text: 'Frequency (Hz)' } } 
-                    }, 
-                    onDoubleClick: (e) => { e.chart.resetZoom(); }
-                }
-            });
-
             updateClock();
-            updateDashboardData();
             setInterval(updateClock, 1000);
+            updateDashboardData();
         };
     </script>
 </body>
@@ -2344,172 +2143,88 @@ String html = R"rawliteral(
 
 void handleMetrics() {
     DynamicJsonDocument doc(4096); 
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(250)) == pdTRUE) {
-        doc["accelRms"]["x"] = accelRmsX; doc["accelRms"]["y"] = accelRmsY; doc["accelRms"]["z"] = accelRmsZ;
-        doc["accelPeak"]["x"] = accelPeakX; doc["accelPeak"]["y"] = accelPeakY; doc["accelPeak"]["z"] = accelPeakZ;
-        doc["accelRms2"]["x"] = accelRms2X; doc["accelRms2"]["y"] = accelRms2Y; doc["accelRms2"]["z"] = accelRms2Z;
-        doc["accelPeak2"]["x"] = accelPeak2X; doc["accelPeak2"]["y"] = accelPeak2Y; doc["accelPeak2"]["z"] = accelPeak2Z;
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         
-        doc["accelMetricRms"]["x"] = accelMetricRmsX; doc["accelMetricRms"]["y"] = accelMetricRmsY; doc["accelMetricRms"]["z"] = accelMetricRmsZ;
-        doc["accelMetricPeak"]["x"] = accelMetricPeakX; doc["accelMetricPeak"]["y"] = accelMetricPeakY; doc["accelMetricPeak"]["z"] = accelMetricPeakZ;
-        doc["accelMetricRms2"]["x"] = accelMetricRms2X; doc["accelMetricRms2"]["y"] = accelMetricRms2Y; doc["accelMetricRms2"]["z"] = accelMetricRms2Z;
-        doc["accelMetricPeak2"]["x"] = accelMetricPeak2X; doc["accelMetricPeak2"]["y"] = accelMetricPeak2Y; doc["accelMetricPeak2"]["z"] = accelMetricPeak2Z;
+        // --- 1. Populate All Metrics (Full Table Support) ---
+        JsonObject accelRms = doc.createNestedObject("accelRms");
+        accelRms["x"] = accelRmsX; accelRms["y"] = accelRmsY; accelRms["z"] = accelRmsZ;
+        JsonObject accelPeak = doc.createNestedObject("accelPeak");
+        accelPeak["x"] = accelPeakX; accelPeak["y"] = accelPeakY; accelPeak["z"] = accelPeakZ;
+        JsonObject accelRms2 = doc.createNestedObject("accelRms2");
+        accelRms2["x"] = accelRms2X; accelRms2["y"] = accelRms2Y; accelRms2["z"] = accelRms2Z;
+        JsonObject accelPeak2 = doc.createNestedObject("accelPeak2");
+        accelPeak2["x"] = accelPeak2X; accelPeak2["y"] = accelPeak2Y; accelPeak2["z"] = accelPeak2Z;
         
-        doc["veloRms"]["x"] = veloRmsX; doc["veloRms"]["y"] = veloRmsY; doc["veloRms"]["z"] = veloRmsZ;
-        doc["veloPeak"]["x"] = veloPeakX; doc["veloPeak"]["y"] = veloPeakY; doc["veloPeak"]["z"] = veloPeakZ;
-        
-        doc["veloWideRms"]["x"] = veloWideRmsX; doc["veloWideRms"]["y"] = veloWideRmsY; doc["veloWideRms"]["z"] = veloWideRmsZ;
-        doc["veloWidePeak"]["x"] = veloWidePeakX; doc["veloWidePeak"]["y"] = veloWidePeakY; doc["veloWidePeak"]["z"] = veloWidePeakZ;
-        
-        doc["displRms"]["x"] = displRmsX; doc["displRms"]["y"] = displRmsY; doc["displRms"]["z"] = displRmsZ;
-        doc["displPeak"]["x"] = displPeakX; doc["displPeak"]["y"] = displPeakY; doc["displPeak"]["z"] = displPeakZ;
+        JsonObject amRms = doc.createNestedObject("accelMetricRms");
+        amRms["x"] = accelMetricRmsX; amRms["y"] = accelMetricRmsY; amRms["z"] = accelMetricRmsZ;
+        JsonObject amPeak = doc.createNestedObject("accelMetricPeak");
+        amPeak["x"] = accelMetricPeakX; amPeak["y"] = accelMetricPeakY; amPeak["z"] = accelMetricPeakZ;
+        JsonObject amRms2 = doc.createNestedObject("accelMetricRms2");
+        amRms2["x"] = accelMetricRms2X; amRms2["y"] = accelMetricRms2Y; amRms2["z"] = accelMetricRms2Z;
+        JsonObject amPeak2 = doc.createNestedObject("accelMetricPeak2");
+        amPeak2["x"] = accelMetricPeak2X; amPeak2["y"] = accelMetricPeak2Y; amPeak2["z"] = accelMetricPeak2Z;
 
-        doc["displLowRms"]["x"] = displLowRmsX; doc["displLowRms"]["y"] = displLowRmsY; doc["displLowRms"]["z"] = displLowRmsZ;
-        doc["displLowPeak"]["x"] = displLowPeakX; doc["displLowPeak"]["y"] = displLowPeakY; doc["displLowPeak"]["z"] = displLowPeakZ;
+        JsonObject veloRms = doc.createNestedObject("veloRms");
+        veloRms["x"] = veloRmsX; veloRms["y"] = veloRmsY; veloRms["z"] = veloRmsZ;
+        JsonObject veloPeak = doc.createNestedObject("veloPeak");
+        veloPeak["x"] = veloPeakX; veloPeak["y"] = veloPeakY; veloPeak["z"] = veloPeakZ;
+        
+        JsonObject vwRms = doc.createNestedObject("veloWideRms");
+        vwRms["x"] = veloWideRmsX; vwRms["y"] = veloWideRmsY; vwRms["z"] = veloWideRmsZ;
+        JsonObject vwPeak = doc.createNestedObject("veloWidePeak");
+        vwPeak["x"] = veloWidePeakX; vwPeak["y"] = veloWidePeakY; vwPeak["z"] = veloWidePeakZ;
+        
+        JsonObject displRms = doc.createNestedObject("displRms");
+        displRms["x"] = displRmsX; displRms["y"] = displRmsY; displRms["z"] = displRmsZ;
+        JsonObject displPeak = doc.createNestedObject("displPeak");
+        displPeak["x"] = displPeakX; displPeak["y"] = displPeakY; displPeak["z"] = displPeakZ;
+        
+        JsonObject dlRms = doc.createNestedObject("displLowRms");
+        dlRms["x"] = displLowRmsX; dlRms["y"] = displLowRmsY; dlRms["z"] = displLowRmsZ;
+        JsonObject dlPeak = doc.createNestedObject("displLowPeak");
+        dlPeak["x"] = displLowPeakX; dlPeak["y"] = displLowPeakY; dlPeak["z"] = displLowPeakZ;
 
-        doc["truePeak"]["x"] = truePeakX; doc["truePeak"]["y"] = truePeakY; doc["truePeak"]["z"] = truePeakZ;
-        doc["crestFactor"]["x"] = crestFactorX; doc["crestFactor"]["y"] = crestFactorY; doc["crestFactor"]["z"] = crestFactorZ;
+        JsonObject truePeak = doc.createNestedObject("truePeak");
+        truePeak["x"] = truePeakX; truePeak["y"] = truePeakY; truePeak["z"] = truePeakZ;
+        JsonObject crestFactor = doc.createNestedObject("crestFactor");
+        crestFactor["x"] = crestFactorX; crestFactor["y"] = crestFactorY; crestFactor["z"] = crestFactorZ;
+        JsonObject stdDeviation = doc.createNestedObject("stdDeviation");
+        stdDeviation["x"] = stdDeviationX; stdDeviation["y"] = stdDeviationY; stdDeviation["z"] = stdDeviationZ;
+        
         doc["temperature"] = temperature;
-        
         doc["status"] = systemStatus;
         doc["traffic_light"] = trafficLightStatus; 
-        doc["newWaveformAvailable"] = newWaveformAvailable;
-        doc["newSpectrumAvailable"] = newSpectrumAvailable;
-        doc["lastCaptureTimestamp"] = lastCaptureTimestamp;
-        doc["lastAutoCaptureTimestamp"] = lastAutoCaptureTimestamp;
-        doc["lastAutoCaptureMillis"] = lastAutoCaptureMillis;
-        doc["interval"] = dataCaptureInterval;
-        doc["uptimeMillis"] = millis();
+        
+        // --- 2. Add Configuration Details for the Transmission Tab ---
+        doc["mqtt_server"] = mqtt_server_str;
+        doc["mqtt_topic"] = mqtt_topic_str;
+        doc["modbus_enabled"] = modbusTcpEnabled;
+        doc["modbus_port"] = modbusTcpPort;
+        doc["modbus_id"] = modbus_slave_id_val;
+        
         switch(lastCapturedAxis) {
             case AXIS_X: doc["capturedAxis"] = "X"; break;
             case AXIS_Y: doc["capturedAxis"] = "Y"; break;
             case AXIS_Z: doc["capturedAxis"] = "Z"; break;
             default: doc["capturedAxis"] = "NONE"; break;
         }
+        
         xSemaphoreGive(dataMutex);
     } else {
         doc["status"] = "System Busy";
     }
+    
+    // Check MQTT connection outside Mutex to avoid deadlocks
     doc["mqtt_connected"] = (mqttClient && mqttClient->connected());
+    
     String payload;
     serializeJson(doc, payload);
     server.send(200, "application/json", payload);
 }
 
-void handleFullWaveform() {
-    bool available = false;
-    // Check if new data is available without holding the mutex too long
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        available = newWaveformAvailable;
-        xSemaphoreGive(dataMutex);
-    }
-    
-    // If no data, return empty array to prevent JS errors
-    if (!available) { 
-        server.send(200, "application/json", "[]"); 
-        return; 
-    }
-
-    // Copy to global scratch buffer to avoid holding mutex during slow Network Send
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        memcpy(globalScratchBuffer, fullWaveform, WAVEFORM_TOTAL_POINTS * sizeof(int16_t));
-        xSemaphoreGive(dataMutex);
-    } else {
-        server.send(503, "text/plain", "System busy, could not access data");
-        return;
-    }
-
-    // Begin Chunked Transfer (Essential for large arrays on ESP32)
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "application/json", "");
-    
-    const float scaleFactor = 0.001; // Scale integer back to Gs
-    const int CHUNK_SIZE = 400;      // Send in small chunks to prevent OOM
-    char num_buffer[20];
-
-    server.sendContent("[");
-    
-    for (int i = 0; i < WAVEFORM_TOTAL_POINTS; i += CHUNK_SIZE) {
-        if (!server.client().connected()) break;
-        
-        int pointsToSend = min(CHUNK_SIZE, (int)(WAVEFORM_TOTAL_POINTS - i));
-        String chunk = "";
-        
-        // Reserve memory to prevent re-allocation thrashing
-        chunk.reserve(pointsToSend * 10); 
-
-        for (int j = 0; j < pointsToSend; j++) {
-            // Convert int16 to float string
-            dtostrf(globalScratchBuffer[i + j] * scaleFactor, 1, 4, num_buffer);
-            chunk += num_buffer;
-            
-            // Add comma unless it's the very last point
-            if (i + j < WAVEFORM_TOTAL_POINTS - 1) { 
-                chunk += ","; 
-            }
-        }
-        server.sendContent(chunk);
-        
-        // Small delay to allow WiFi stack to process background tasks
-        vTaskDelay(2); 
-    }
-    
-    server.sendContent("]");
-}
-
-void handleFullSpectrum() {
-    bool available = false;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        available = newSpectrumAvailable;
-        xSemaphoreGive(dataMutex);
-    }
-    if (!available) { server.send(200, "application/json", "{}"); return; }
-
-    // FIX: Use global buffer
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        memcpy(globalScratchBuffer, spectrumData, SPECTRUM_TOTAL_POINTS * sizeof(int16_t));
-        xSemaphoreGive(dataMutex);
-    } else {
-        server.send(503, "text/plain", "System busy, could not get data");
-        return;
-    }
-
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "application/json", "");
-    const float scaleFactor = 0.001;
-    const float freq_resolution = (13333.333 / 16384.0);
-    const int CHUNK_SIZE = 256;
-    char num_buffer[20];
-    
-    server.sendContent("{\"points\":[");
-    for (int i = 0; i < SPECTRUM_TOTAL_POINTS; i += CHUNK_SIZE) {
-        if (!server.client().connected()) break;
-        int pointsToSend = min(CHUNK_SIZE, (int)(SPECTRUM_TOTAL_POINTS - i));
-        String chunk = "";
-        for (int j = 0; j < pointsToSend; j++) {
-            dtostrf(abs(globalScratchBuffer[i + j] * scaleFactor), 1, 4, num_buffer);
-            chunk += num_buffer;
-            if (i + j < SPECTRUM_TOTAL_POINTS - 1) { chunk += ","; }
-        }
-        server.sendContent(chunk);
-        vTaskDelay(1);
-    }
-    
-    server.sendContent("],\"labels\":[");
-    for (int i = 0; i < SPECTRUM_TOTAL_POINTS; i += CHUNK_SIZE) {
-        if (!server.client().connected()) break;
-        String chunk = "";
-        int pointsToProcess = min(CHUNK_SIZE, (int)(SPECTRUM_TOTAL_POINTS - i));
-        for (int j = 0; j < pointsToProcess; j++) {
-            dtostrf((i + j) * freq_resolution, 1, 4, num_buffer);
-            chunk += num_buffer;
-            if (i + j < SPECTRUM_TOTAL_POINTS - 1) { chunk += ","; }
-        }
-        server.sendContent(chunk);
-        vTaskDelay(1);
-    }
-    server.sendContent("]}");
-}
+// NOTE: handleFullWaveform/Spectrum are unused without graphs but kept for API compat
+void handleFullWaveform() { server.send(200, "application/json", "[]"); }
+void handleFullSpectrum() { server.send(200, "application/json", "{}"); }
 
 void handleTriggerCapture() {
     String axis_str = server.arg("axis");
@@ -2530,7 +2245,7 @@ void handleTriggerCapture() {
         isBusy = (currentDataState != DD_IDLE);
         if (!isBusy) {
             requestedAxis = selectedAxis;
-            requestedCapture = CAPTURE_BOTH;
+            requestedCapture = CAPTURE_BOTH; // Still captures buffer for MQTT/Modbus
             currentDataState = DD_REQUEST_DATA;
 
             isAutoCaptureCycleActive = isCycleStart;
@@ -2541,42 +2256,86 @@ void handleTriggerCapture() {
         }
         xSemaphoreGive(dataMutex);
     }
-    server.send(200, "text/plain", isBusy ? "Device is busy." : "Capture trigger accepted for axis " + axis_str);
+    server.send(200, "text/plain", isBusy ? "Device is busy." : "Capture trigger accepted.");
 }
 
+// --- SAFE CHUNKED SETTINGS PAGE ---
 void handleSettings() {
-    String html;
-    html += R"rawliteral(
+    // 1. Tell the browser we are sending the page in parts (Unknown Length)
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN); 
+    server.send(200, "text/html", ""); // Start the connection
+
+    // 2. Send Part 1: The Header and CSS (Static)
+    // We break this up so it doesn't use much RAM
+    server.sendContent(R"rawliteral(
 <!DOCTYPE html><html><head><title>Device Settings</title><meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://unpkg.com/lucide@latest"></script>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f4f6f8;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px;box-sizing:border-box}.container{width:100%;max-width:500px;background-color:white;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.08);overflow:hidden}.header{text-align:center;padding:20px;border-bottom:1px solid #e9ecef}.header h2{margin:0;font-size:24px;font-weight:600;color:#2c3e50}.settings-list{list-style:none;padding:0;margin:0}.settings-item{display:flex;align-items:center;padding:15px 20px;border-bottom:1px solid #e9ecef;text-decoration:none;color:inherit;transition:background-color .2s}.settings-item:hover{background-color:#f8f9fa}.settings-item:last-child{border-bottom:none}.icon{width:24px;height:24px;margin-right:20px;color:#007bff}.content{flex-grow:1;text-align:left}.content h3{margin:0;font-size:16px;font-weight:500;color:#343a40}.content p{margin:2px 0 0;font-size:14px;color:#6c757d;display:flex;align-items:center}.chevron{width:20px;height:20px;color:#ced4da}.status-dot{height:9px;width:9px;border-radius:50%;display:inline-block;margin-right:6px}.status-dot.connected{background-color:#2ecc71}.status-dot.disconnected{background-color:#e74c3c}.actions{padding:20px;background-color:#f8f9fa;border-top:1px solid #e9ecef}.btn{display:block;width:100%;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:600;text-align:center;text-decoration:none;box-sizing:border-box;transition:background-color .2s,color .2s}.btn-danger{background-color:#e74c3c;color:white;margin-bottom:10px}.btn-danger:hover{background-color:#c0392b}.btn-secondary{background-color:transparent;color:#007bff}.btn-secondary:hover{background-color:#e9ecef}</style></head><body><div class="container"><div class="header"><h2>Device Settings</h2></div><div class="settings-list">
-<a href="/wifi_settings" class="settings-item"><div class="icon"><i data-lucide="wifi"></i></div><div class="content"><h3>Wi-Fi</h3><p><span class="status-dot )rawliteral";
-    html += (WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
-    html += R"rawliteral("></span>)rawliteral";
-    html += (WiFi.status() == WL_CONNECTED ? "Connected to " + WiFi.SSID() : "AP Mode");
-    html += R"rawliteral(</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
-<a href="/mqtt_settings" class="settings-item"><div class="icon"><i data-lucide="cloud"></i></div><div class="content"><h3>MQTT</h3><p><span class="status-dot )rawliteral";
-    html += (mqttClient && mqttClient->connected() ? "connected" : "disconnected");
-    html += R"rawliteral("></span>)rawliteral";
-    html += (mqttEnabled ? (mqttClient && mqttClient->connected() ? "Connected" : "Disconnected") : "Disabled");
-    html += R"rawliteral(</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
-<a href="/rs485_settings" class="settings-item"><div class="icon"><i data-lucide="activity"></i></div><div class="content"><h3>Modbus RTU (RS485) Sensor</h3><p><span class="status-dot connected"></span>Ready</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
+)rawliteral");
+
+    // 3. Send Part 2: Wi-Fi Status (Dynamic)
+    String wifiClass = (WiFi.status() == WL_CONNECTED) ? "connected" : "disconnected";
+    String wifiText = (WiFi.status() == WL_CONNECTED) ? "Connected to " + WiFi.SSID() : "AP Mode";
+    
+    String chunk1 = R"rawliteral(<a href="/wifi_settings" class="settings-item"><div class="icon"><i data-lucide="wifi"></i></div><div class="content"><h3>Wi-Fi</h3><p><span class="status-dot )rawliteral";
+    chunk1 += wifiClass + R"rawliteral("></span>)rawliteral" + wifiText + R"rawliteral(</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>)rawliteral";
+    server.sendContent(chunk1);
+
+    // 4. Send Part 3: MQTT Status (Dynamic)
+    String mqttClass = (mqttClient && mqttClient->connected()) ? "connected" : "disconnected";
+    String mqttText = (mqttEnabled) ? ((mqttClient && mqttClient->connected()) ? "Connected" : "Disconnected") : "Disabled";
+    
+    String chunk2 = R"rawliteral(<a href="/mqtt_settings" class="settings-item"><div class="icon"><i data-lucide="cloud"></i></div><div class="content"><h3>MQTT</h3><p><span class="status-dot )rawliteral";
+    chunk2 += mqttClass + R"rawliteral("></span>)rawliteral" + mqttText + R"rawliteral(</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>)rawliteral";
+    server.sendContent(chunk2);
+
+    // 5. Send Part 4: Modbus Status (Dynamic)
+    String mbClass = (modbusTcpEnabled) ? "connected" : "disconnected";
+    String mbText = (modbusTcpEnabled) ? "Enabled" : "Disabled";
+
+    String chunk3 = R"rawliteral(<a href="/rs485_settings" class="settings-item"><div class="icon"><i data-lucide="activity"></i></div><div class="content"><h3>Modbus RTU (RS485) Sensor</h3><p><span class="status-dot connected"></span>Ready</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
 <a href="/modbustcp_settings" class="settings-item"><div class="icon"><i data-lucide="server"></i></div><div class="content"><h3>Modbus TCP Server</h3><p><span class="status-dot )rawliteral";
-    html += (modbusTcpEnabled ? "connected" : "disconnected");
-    html += R"rawliteral("></span>)rawliteral";
-    html += (modbusTcpEnabled ? "Enabled" : "Disabled");
-    html += R"rawliteral(</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
+    chunk3 += mbClass + R"rawliteral("></span>)rawliteral" + mbText + R"rawliteral(</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>)rawliteral";
+    server.sendContent(chunk3);
+
+    // 6. Send Part 5: The Footer and Scripts (Static)
+    server.sendContent(R"rawliteral(
 <a href="/time_settings" class="settings-item"><div class="icon"><i data-lucide="clock"></i></div><div class="content"><h3>Time & Date</h3><p>Timezone & Manual Set</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
 <a href="/device_info" class="settings-item"><div class="icon" style="color:#6c757d"><i data-lucide="info"></i></div><div class="content"><h3>Device Info</h3><p>View model, serial, and firmware</p></div><div class="chevron"><i data-lucide="chevron-right"></i></div></a>
 </div><div class="actions"><button class="btn btn-danger" onclick="rebootDevice()">Reboot Device</button><a href="/" class="btn btn-secondary">Back to Dashboard</a></div></div>
-<script>lucide.createIcons(); function rebootDevice(){if(confirm("Are you sure you want to reboot the device?")){fetch("/reboot").then(()=>{alert("Device is rebooting...")})}}</script></body></html>)rawliteral";
-    server.send(200, "text/html", html);
+<script>
+    if (typeof lucide !== 'undefined') { lucide.createIcons(); }
+    function rebootDevice(){if(confirm("Are you sure you want to reboot the device?")){fetch("/reboot").then(()=>{alert("Device is rebooting...")})}}
+</script></body></html>)rawliteral");
+
+    // 7. Finish the transmission
+    server.sendContent(""); 
 }
 
+// --- SAFE CHUNKED WIFI SETTINGS ---
 void handleWifiSettings() {
-    String html = R"rawliteral(
-<!DOCTYPE html><html><head><title>Wi-Fi Settings</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f4f6f8;display:flex;justify-content:center;align-items:center;min-height:100vh}.container{width:100%;max-width:500px;padding:20px;box-sizing:border-box;background-color:white;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,.1)}.header{text-align:center;padding-bottom:20px;border-bottom:2px solid #e9ecef;margin-bottom:20px}.header h2{margin:0;font-size:24px;font-weight:600;color:#2c3e50}.form-group{margin-bottom:15px}label{display:block;margin-bottom:8px;font-size:14px;font-weight:600}input[type=text],input[type=password]{width:100%;padding:12px;box-sizing:border-box;border:1px solid #ced4da;border-radius:8px;font-size:16px;transition:border-color .3s}input[type=text]:focus,input[type=password]:focus{outline:0;border-color:#007bff}.btn-primary{width:100%;padding:12px;background-color:#007bff;color:white;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:600;transition:background-color .3s}.btn-primary:hover{background-color:#0056b3}.btn-scan{background-color:#6c757d;margin-bottom:15px}.btn-scan:hover{background-color:#5a6268}.wifi-list-container{max-height:250px;overflow-y:auto;border:1px solid #e9ecef;border-radius:8px;padding:5px;background-color:#f8f9fa}#wifi-list{list-style:none;padding:0;margin:0}#wifi-list li{padding:12px 15px;cursor:pointer;border-bottom:1px solid #e9ecef;transition:background-color .2s;display:flex;justify-content:space-between;align-items:center}#wifi-list li:last-child{border-bottom:none}#wifi-list li:hover{background-color:#e9ecef}.wifi-ssid{font-size:16px;font-weight:500;flex-grow:1}.wifi-rssi{font-size:14px;color:#6c757d;font-weight:400}.status-bar{text-align:center;margin-top:20px;padding-top:20px;border-top:2px solid #e9ecef;font-size:14px;color:#6c757d;font-weight:500}.nav-link{display:block;text-align:center;margin-top:20px;color:#007bff;text-decoration:none;font-weight:600;font-size:14px}.nav-link:hover{text-decoration:underline}</style></head><body><div class="container"><div class="header"><h2>Wi-Fi Settings</h2></div><div class="status-bar">Current Status: )rawliteral" + (WiFi.status() == WL_CONNECTED ? "Connected to " + WiFi.SSID() : "AP Mode active") + R"rawliteral(<br>IP Address: )rawliteral" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + R"rawliteral(</div><div class="form-section"><button class="btn-primary btn-scan" onclick="scanWifi()">Scan for Networks</button><div class="wifi-list-container"><ul id="wifi-list"></ul></div><form onsubmit="return saveWifi()"><div class="form-group"><label for="ssid">Network Name (SSID)</label><input type="text" id="ssid" name="ssid" required></div><div class="form-group"><label for="pass">Password</label><input type="password" id="pass" name="pass"></div><button type="submit" class="btn-primary">Save and Connect</button></form></div><a href="/settings" class="nav-link">&larr; Back to Settings</a></div><script>function scanWifi(){const t=document.getElementById("wifi-list");t.innerHTML="<li>Scanning...</li>",fetch("/scanwifi").then(t=>t.json()).then(e=>{t.innerHTML="",0===e.length?t.innerHTML="<li>No networks found.</li>":e.forEach(e=>{const n=document.createElement("li");n.innerHTML=`<span class="wifi-ssid">${e.ssid}</span><span class="wifi-rssi">${e.rssi} dBm</span>`,n.onclick=()=>{document.getElementById("ssid").value=e.ssid},t.appendChild(n)})})}function saveWifi(){const t=document.getElementById("ssid").value,e=document.getElementById("pass").value;return fetch("/savewifi?ssid="+encodeURIComponent(t)+"&pass="+encodeURIComponent(e)),alert("Saving credentials... The device will reboot."),!1}</script></body></html>)rawliteral";
-    server.send(200, "text/html", html);
+    // 1. Start the Chunked Response
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    // 2. Send Header & CSS
+    server.sendContent(R"rawliteral(
+<!DOCTYPE html><html><head><title>Wi-Fi Settings</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f4f6f8;display:flex;justify-content:center;align-items:center;min-height:100vh}.container{width:100%;max-width:500px;padding:20px;box-sizing:border-box;background-color:white;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,.1)}.header{text-align:center;padding-bottom:20px;border-bottom:2px solid #e9ecef;margin-bottom:20px}.header h2{margin:0;font-size:24px;font-weight:600;color:#2c3e50}.form-group{margin-bottom:15px}label{display:block;margin-bottom:8px;font-size:14px;font-weight:600}input[type=text],input[type=password]{width:100%;padding:12px;box-sizing:border-box;border:1px solid #ced4da;border-radius:8px;font-size:16px;transition:border-color .3s}input[type=text]:focus,input[type=password]:focus{outline:0;border-color:#007bff}.btn-primary{width:100%;padding:12px;background-color:#007bff;color:white;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:600;transition:background-color .3s}.btn-primary:hover{background-color:#0056b3}.btn-scan{background-color:#6c757d;margin-bottom:15px}.btn-scan:hover{background-color:#5a6268}.wifi-list-container{max-height:250px;overflow-y:auto;border:1px solid #e9ecef;border-radius:8px;padding:5px;background-color:#f8f9fa}#wifi-list{list-style:none;padding:0;margin:0}#wifi-list li{padding:12px 15px;cursor:pointer;border-bottom:1px solid #e9ecef;transition:background-color .2s;display:flex;justify-content:space-between;align-items:center}#wifi-list li:last-child{border-bottom:none}#wifi-list li:hover{background-color:#e9ecef}.wifi-ssid{font-size:16px;font-weight:500;flex-grow:1}.wifi-rssi{font-size:14px;color:#6c757d;font-weight:400}.status-bar{text-align:center;margin-top:20px;padding-top:20px;border-top:2px solid #e9ecef;font-size:14px;color:#6c757d;font-weight:500}.nav-link{display:block;text-align:center;margin-top:20px;color:#007bff;text-decoration:none;font-weight:600;font-size:14px}.nav-link:hover{text-decoration:underline}</style></head><body><div class="container"><div class="header"><h2>Wi-Fi Settings</h2></div>
+)rawliteral");
+
+    // 3. Send Dynamic Status Bar
+    String statusMsg = (WiFi.status() == WL_CONNECTED ? "Connected to " + WiFi.SSID() : "AP Mode active");
+    String ipMsg = (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
+    
+    server.sendContent(R"rawliteral(<div class="status-bar">Current Status: )rawliteral" + statusMsg + R"rawliteral(<br>IP Address: )rawliteral" + ipMsg + R"rawliteral(</div>)rawliteral");
+
+    // 4. Send Form & Scripts
+    server.sendContent(R"rawliteral(
+<div class="form-section"><button class="btn-primary btn-scan" onclick="scanWifi()">Scan for Networks</button><div class="wifi-list-container"><ul id="wifi-list"></ul></div><form onsubmit="return saveWifi()"><div class="form-group"><label for="ssid">Network Name (SSID)</label><input type="text" id="ssid" name="ssid" required></div><div class="form-group"><label for="pass">Password</label><input type="password" id="pass" name="pass"></div><button type="submit" class="btn-primary">Save and Connect</button></form></div><a href="/settings" class="nav-link">&larr; Back to Settings</a></div><script>function scanWifi(){const t=document.getElementById("wifi-list");t.innerHTML="<li>Scanning...</li>",fetch("/scanwifi").then(t=>t.json()).then(e=>{t.innerHTML="",0===e.length?t.innerHTML="<li>No networks found.</li>":e.forEach(e=>{const n=document.createElement("li");n.innerHTML=`<span class="wifi-ssid">${e.ssid}</span><span class="wifi-rssi">${e.rssi} dBm</span>`,n.onclick=()=>{document.getElementById("ssid").value=e.ssid},t.appendChild(n)})})}function saveWifi(){const t=document.getElementById("ssid").value,e=document.getElementById("pass").value;return fetch("/savewifi?ssid="+encodeURIComponent(t)+"&pass="+encodeURIComponent(e)),alert("Saving credentials... The device will reboot."),!1}</script></body></html>
+)rawliteral");
+
+    // 5. Close Stream
+    server.sendContent("");
 }
 
 void handleSaveWifi() { 
@@ -2589,9 +2348,16 @@ void handleSaveWifi() {
     ESP.restart(); 
 }
 
+// --- SAFE CHUNKED MQTT SETTINGS ---
 void handleMqttSettings() {
-    String html = R"rawliteral(
+    // 1. Start Stream
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    // 2. Header & Styles
+    server.sendContent(R"rawliteral(
 <!DOCTYPE html><html><head><title>MQTT Settings</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/lucide@latest"></script>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f4f6f8;display:flex;justify-content:center;padding:20px 0;}
 .container{width:100%;max-width:500px;padding:20px;box-sizing:border-box;background-color:white;border-radius:12px;box-shadow:0 8px 20px rgba(0,0,0,.1);}
@@ -2607,22 +2373,51 @@ input[type=text],input[type=password],input[type=number]{width:100%;padding:12px
 input:checked+.slider{background-color:#28a745} input:checked+.slider:before{transform:translateX(22px)}
 #skip_validation_group { display: none; }
 .status-bar{text-align:center;margin-top:20px;padding:15px;border-radius:8px;font-size:14px;font-weight:500;background-color:#f8f9fa;color:#6c757d;}
+.info-box { background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; border: 1px solid #ffeeba; margin-bottom: 20px; font-size: 14px; line-height: 1.5; }
+.info-box i { vertical-align: text-bottom; margin-right: 5px; }
+.serial-badge { font-family: monospace; font-weight: bold; background: #fff; padding: 2px 6px; border-radius: 4px; border: 1px solid #e2e3e5; margin-left: 5px; color: #333; font-size: 1.1em;}
 </style>
 </head><body><div class="container"><div class="header"><h2>MQTT Settings</h2></div>
+)rawliteral");
+
+    // 3. Dynamic Info Box (Serial Number)
+    server.sendContent(R"rawliteral(
+<div class="info-box">
+    <strong><i data-lucide="alert-triangle"></i> Security Requirement:</strong><br>
+    All MQTT commands sent to this device <u>MUST</u> include the correct <b>serial_number</b> field.<br>
+    <strong>Target Device Serial Number:</strong> <span class="serial-badge">)rawliteral" + sensor_serial + R"rawliteral(</span>
+</div>
 <form onsubmit="return saveMqtt()">
+)rawliteral");
+
+    // 4. Form Controls (Toggles)
+    // We send these as static HTML; the Javascript at the bottom will check/uncheck them
+    server.sendContent(R"rawliteral(
 <div class="form-group inline"><label for="enabled" style="margin-bottom:0;">Enable MQTT Client</label><label class="switch"><input type="checkbox" id="enabled" name="enabled"><span class="slider"></span></label></div>
 <div class="form-group inline"><label for="tls" style="margin-bottom:0;">Use TLS/SSL Security</label><label class="switch"><input type="checkbox" id="tls" name="tls"><span class="slider"></span></label></div>
 <div class="form-group inline" id="skip_validation_group"><label for="skip_val" style="margin-bottom:0;">Skip Certificate Validation</label><label class="switch"><input type="checkbox" id="skip_val" name="skip_val"><span class="slider"></span></label></div>
 <div class="form-group inline"><label for="progress" style="margin-bottom:0;">Publish Progress Updates</label><label class="switch"><input type="checkbox" id="progress" name="progress"><span class="slider"></span></label></div>
-<div class="form-group"><label for="server">Broker Address</label><input type="text" id="server" name="server" value=")rawliteral" + mqtt_server_str + R"rawliteral(" required></div>
-<div class="form-group"><label for="port">Port</label><input type="number" id="port" name="port" value=")rawliteral" + String(mqtt_port_val) + R"rawliteral(" required></div>
-<div class="form-group"><label for="user">Username</label><input type="text" id="user" name="user" value=")rawliteral" + mqtt_user_str + R"rawliteral("></div>
-<div class="form-group"><label for="pass">Password</label><input type="password" id="pass" name="pass" value=")rawliteral" + mqtt_pass_str + R"rawliteral("></div>
-<div class="form-group"><label for="topic">Base Topic</label><input type="text" id="topic" name="topic" value=")rawliteral" + mqtt_topic_str + R"rawliteral(" required></div>
+)rawliteral");
+
+    // 5. Form Inputs (Pre-filled with Variables)
+    // We break this into smaller chunks to allow variable insertion
+    server.sendContent(R"rawliteral(<div class="form-group"><label for="server">Broker Address</label><input type="text" id="server" name="server" value=")rawliteral" + mqtt_server_str + R"rawliteral(" required></div>)rawliteral");
+    
+    server.sendContent(R"rawliteral(<div class="form-group"><label for="port">Port</label><input type="number" id="port" name="port" value=")rawliteral" + String(mqtt_port_val) + R"rawliteral(" required></div>)rawliteral");
+    
+    server.sendContent(R"rawliteral(<div class="form-group"><label for="user">Username</label><input type="text" id="user" name="user" value=")rawliteral" + mqtt_user_str + R"rawliteral("></div>)rawliteral");
+    
+    server.sendContent(R"rawliteral(<div class="form-group"><label for="pass">Password</label><input type="password" id="pass" name="pass" value=")rawliteral" + mqtt_pass_str + R"rawliteral("></div>)rawliteral");
+    
+    server.sendContent(R"rawliteral(<div class="form-group"><label for="topic">Base Topic</label><input type="text" id="topic" name="topic" value=")rawliteral" + mqtt_topic_str + R"rawliteral(" required></div>)rawliteral");
+
+    // 6. Footer & Scripts (Dynamic JS Injection for Checkboxes)
+    server.sendContent(R"rawliteral(
 <button type="submit" class="btn-primary">Save and Reboot</button></form>
 <div class="status-bar" id="mqtt-status">Loading status...</div>
 <a href="/settings" class="nav-link">&larr; Back to Settings</a></div>
 <script>
+if (typeof lucide !== 'undefined') { lucide.createIcons(); }
 function saveMqtt(){
     const enabled = document.getElementById('enabled').checked;
     const tls = document.getElementById('tls').checked;
@@ -2649,11 +2444,7 @@ function updateTlsOptions() {
     }
 }
 function updateMqttStatus() {
-    fetch('/mqtt_status')
-        .then(r => r.json())
-        .then(data => {
-            document.getElementById('mqtt-status').textContent = data.status;
-        });
+    fetch('/mqtt_status').then(r => r.json()).then(data => { document.getElementById('mqtt-status').textContent = data.status; });
 }
 window.onload = function() {
     document.getElementById('enabled').checked = )rawliteral" + String(mqttEnabled ? "true" : "false") + R"rawliteral(;
@@ -2665,8 +2456,11 @@ window.onload = function() {
     updateMqttStatus();
     setInterval(updateMqttStatus, 2000);
 }
-</script></body></html>)rawliteral";
-    server.send(200, "text/html", html);
+</script></body></html>
+)rawliteral");
+
+    // 7. Close Stream
+    server.sendContent("");
 }
 
 void handleSaveMqtt() {
@@ -2830,260 +2624,27 @@ void handleClearDynamicData() {
     server.send(200, "text/plain", "Cached data cleared.");
 }
 
-void handleModbusTcpSettings() {
-    String ipAddress = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-    
-    String html = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Modbus TCP Server</title>
-    <style>
-        :root { --primary: #0056b3; --secondary: #6c757d; --bg: #f8f9fa; --border: #dee2e6; --green: #28a745; --red: #dc3545; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
-        h1 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid var(--border); padding-bottom: 15px; display: flex; justify-content: space-between; align-items: center; }
-        .config-box { background: #e9ecef; padding: 20px; border-radius: 8px; margin-bottom: 30px; border-left: 5px solid var(--primary); }
-        .form-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
-        .info-row { display: flex; gap: 20px; margin-bottom: 20px; font-family: monospace; font-size: 1.1em; background: #fff; padding: 10px; border-radius: 6px; }
-        label { font-weight: 600; color: #495057; }
-        input[type=number] { padding: 8px; border-radius: 4px; border: 1px solid #ced4da; width: 80px; }
-        button { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; }
-        button:hover { background: #004494; }
-        
-        /* Toggle Switch */
-        .switch { position: relative; display: inline-block; width: 50px; height: 26px; }
-        .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
-        .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
-        input:checked + .slider { background-color: var(--green); }
-        input:checked + .slider:before { transform: translateX(24px); }
-
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85em; }
-        th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
-        th { background-color: #f1f3f5; font-weight: 700; position: sticky; top: 0; }
-        .addr-badge { background: #495057; color: white; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 1.1em; }
-        .live-val { font-family: monospace; font-weight: bold; color: var(--primary); font-size: 1.1em; }
-        .badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.8em; font-weight: bold; }
-        .bg-green { background-color: var(--green); }
-        .bg-blue { background-color: #17a2b8; }
-        .axis-header { background-color: #e2e6ea; font-weight: bold; text-align: center; font-size: 1.1em; padding: 8px; }
-        .source-map { font-size: 0.9em; color: #555; margin-top: 5px; line-height: 1.5; border-top: 1px dashed #ccc; padding-top: 4px; }
-        .source-map strong { color: #333; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>Modbus TCP Server</h1>
-    
-    <div class="config-box">
-        <div class="info-row">
-            <span><strong>IP Address:</strong> <span style="color:var(--primary)">)rawliteral" + ipAddress + R"rawliteral(</span></span>
-            <span><strong>Status:</strong> <span id="server-status" style="font-weight:bold;">)rawliteral" + String(modbusTcpEnabled ? "RUNNING" : "STOPPED") + R"rawliteral(</span></span>
-        </div>
-        
-        <form onsubmit="return saveSettings()">
-            <div class="form-row">
-                <label for="enabled">Enable Server</label>
-                <label class="switch"><input type="checkbox" id="enabled" name="enabled"><span class="slider"></span></label>
-            </div>
-            <div class="form-row">
-                <label for="port">Port (Default: 502)</label>
-                <input type="number" id="port" name="port" min="1" max="65535" required>
-            </div>
-            <button type="submit">Save Configuration & Reboot</button>
-        </form>
-    </div>
-
-    <h3>1. Live Metrics Map (Read Only)</h3>
-    <p style="font-size:0.9em; color:#666;">These registers update in real-time based on the sensor poll rate.</p>
-    <table>
-        <thead><tr><th>Address</th><th>Metric Name</th><th>Unit</th><th>Live Value</th></tr></thead>
-        <tbody id="live-table-body"></tbody>
-    </table>
-
-    <h3 style="margin-top:40px;">2. High-Speed Linear Map (Read Only)</h3>
-    <p style="font-size:0.9em; color:#666;">Read these large blocks directly. The data corresponds to the <strong>Last Captured Axis</strong> (X, Y, or Z).</p>
-    <table>
-        <thead><tr><th>Gateway Range</th><th>Size</th><th>Content & Sensor Source Address</th><th>Format</th></tr></thead>
-        <tbody>
-            <tr>
-                <td><span class="addr-badge">1000 - 14333</span></td>
-                <td>13,334</td>
-                <td>
-                    <strong>Time Waveform</strong> (Latest Capture)<br>
-                    <div class="source-map">
-                        <strong>Data Source (Sensor Addr):</strong><br>
-                        X-Axis: 0x1E01 - 0x5216<br>
-                        Y-Axis: 0x7101 - 0xA516<br>
-                        Z-Axis: 0xC401 - 0xF816
-                    </div>
-                </td>
-                <td>Signed Int16<br>(x 0.001 g)</td>
-            </tr>
-            <tr>
-                <td><span class="addr-badge">20000 - 26144</span></td>
-                <td>6,145</td>
-                <td>
-                    <strong>FFT Spectrum</strong> (Latest Capture)<br>
-                    <div class="source-map">
-                        <strong>Data Source (Sensor Addr):</strong><br>
-                        X-Axis: 0x0600 - 0x1E00<br>
-                        Y-Axis: 0x5900 - 0x7100<br>
-                        Z-Axis: 0xAC00 - 0xC400
-                    </div>
-                </td>
-                <td>Unsigned Int16<br>(x 0.001 g)</td>
-            </tr>
-        </tbody>
-    </table>
-
-    <div style="margin-top:30px; text-align:center;">
-        <a href="/settings" style="display:inline-block; padding:10px 20px; background:#6c757d; color:white; text-decoration:none; border-radius:6px; font-weight:600;">&larr; Back to Settings</a>
-    </div>
-</div>
-
-<script>
-    const liveRegisters=[
-        // X-Axis
-        {addr:0,name:"X Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"x"}, 
-        {addr:1,name:"X Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"x"},
-        {addr:2,name:"X Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"x"}, 
-        {addr:3,name:"X Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"x"},
-        {addr:4,name:"X Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"x"}, 
-        {addr:5,name:"X Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"x"},
-        {addr:6,name:"X Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"x"}, 
-        {addr:7,name:"X Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"x"},
-        {addr:8,name:"X True Peak",unit:"g",key:"truePeak",axis:"x"}, 
-        {addr:9,name:"X Crest Factor",unit:"-",key:"crestFactor",axis:"x"},
-        {addr:10,name:"X Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"x"},
-        {addr:11,name:"X Accel Metric Peak",unit:"m/s²",key:"accelMetricPeak",axis:"x"},
-        {addr:12,name:"X Accel Metric RMS2",unit:"m/s²",key:"accelMetricRms2",axis:"x"},
-        {addr:13,name:"X Accel Metric Peak2",unit:"m/s²",key:"accelMetricPeak2",axis:"x"},
-        {addr:14,name:"X Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"x"},
-        {addr:15,name:"X Vel Wide Peak",unit:"mm/s",key:"veloWidePeak",axis:"x"},
-        {addr:16,name:"X Disp Low RMS",unit:"um",key:"displLowRms",axis:"x"},
-        {addr:17,name:"X Disp Low Peak",unit:"um",key:"displLowPeak",axis:"x"},
-
-        // Y-Axis
-        {addr:20,name:"Y Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"y"}, 
-        {addr:21,name:"Y Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"y"},
-        {addr:22,name:"Y Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"y"}, 
-        {addr:23,name:"Y Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"y"},
-        {addr:24,name:"Y Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"y"}, 
-        {addr:25,name:"Y Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"y"},
-        {addr:26,name:"Y Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"y"}, 
-        {addr:27,name:"Y Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"y"},
-        {addr:28,name:"Y True Peak",unit:"g",key:"truePeak",axis:"y"}, 
-        {addr:29,name:"Y Crest Factor",unit:"-",key:"crestFactor",axis:"y"},
-        {addr:30,name:"Y Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"y"},
-        {addr:31,name:"Y Accel Metric Peak",unit:"m/s²",key:"accelMetricPeak",axis:"y"},
-        {addr:32,name:"Y Accel Metric RMS2",unit:"m/s²",key:"accelMetricRms2",axis:"y"},
-        {addr:33,name:"Y Accel Metric Peak2",unit:"m/s²",key:"accelMetricPeak2",axis:"y"},
-        {addr:34,name:"Y Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"y"},
-        {addr:35,name:"Y Vel Wide Peak",unit:"mm/s",key:"veloWidePeak",axis:"y"},
-        {addr:36,name:"Y Disp Low RMS",unit:"um",key:"displLowRms",axis:"y"},
-        {addr:37,name:"Y Disp Low Peak",unit:"um",key:"displLowPeak",axis:"y"},
-
-        // Z-Axis
-        {addr:40,name:"Z Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"z"}, 
-        {addr:41,name:"Z Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"z"},
-        {addr:42,name:"Z Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"z"}, 
-        {addr:43,name:"Z Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"z"},
-        {addr:44,name:"Z Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"z"}, 
-        {addr:45,name:"Z Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"z"},
-        {addr:46,name:"Z Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"z"}, 
-        {addr:47,name:"Z Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"z"},
-        {addr:48,name:"Z True Peak",unit:"g",key:"truePeak",axis:"z"}, 
-        {addr:49,name:"Z Crest Factor",unit:"-",key:"crestFactor",axis:"z"},
-        {addr:50,name:"Z Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"z"},
-        {addr:51,name:"Z Accel Metric Peak",unit:"m/s²",key:"accelMetricPeak",axis:"z"},
-        {addr:52,name:"Z Accel Metric RMS2",unit:"m/s²",key:"accelMetricRms2",axis:"z"},
-        {addr:53,name:"Z Accel Metric Peak2",unit:"m/s²",key:"accelMetricPeak2",axis:"z"},
-        {addr:54,name:"Z Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"z"},
-        {addr:55,name:"Z Vel Wide Peak",unit:"mm/s",key:"veloWidePeak",axis:"z"},
-        {addr:56,name:"Z Disp Low RMS",unit:"um",key:"displLowRms",axis:"z"},
-        {addr:57,name:"Z Disp Low Peak",unit:"um",key:"displLowPeak",axis:"z"},
-        
-        // System
-        {addr:60,name:"Temperature",unit:"C",key:"temperature",axis:null},
-        {addr:90,name:"Waveform Ready",unit:"Bool",key:"newWaveformAvailable",axis:null},
-        {addr:91,name:"Spectrum Ready",unit:"Bool",key:"newSpectrumAvailable",axis:null},
-        {addr:95,name:"PLC Trigger Command",unit:"Write 1",key:"",axis:null}
-    ];
-
-    function generateLiveTable(){
-        let h=''; 
-        liveRegisters.forEach(r=>{
-            let id = `val-${r.key}${r.axis ? '-'+r.axis : ''}`;
-            if(r.addr === 0) h += '<tr class="axis-header"><td colspan="4">X-AXIS</td></tr>';
-            if(r.addr === 20) h += '<tr class="axis-header"><td colspan="4">Y-AXIS</td></tr>';
-            if(r.addr === 40) h += '<tr class="axis-header"><td colspan="4">Z-AXIS</td></tr>';
-            if(r.addr === 60) h += '<tr class="axis-header"><td colspan="4">SYSTEM & CONTROL</td></tr>';
-            
-            let valCell = (r.addr === 95) ? '<i>Write Only</i>' : `<td class="live-val" id="${id}">--</td>`;
-            
-            h+=`<tr>
-                <td><span class="addr-badge">${r.addr}</span></td>
-                <td>${r.name}</td>
-                <td>${r.unit}</td>
-                ${valCell}
-            </tr>`
-        });
-        document.getElementById('live-table-body').innerHTML=h;
-    }
-
-    function updateLiveValues(){
-        fetch('/data').then(r=>r.json()).then(d=>{
-            liveRegisters.forEach(r=>{
-                if (r.addr === 95) return; // Skip trigger register
-                let v = (r.axis) ? d[r.key][r.axis] : d[r.key];
-                let el = document.getElementById(`val-${r.key}${r.axis ? '-'+r.axis : ''}`);
-                if(el) {
-                    if(typeof v === 'boolean') el.textContent = v ? "1 (YES)" : "0 (NO)";
-                    else if(typeof v === 'number') el.textContent = v.toFixed(3);
-                    else el.textContent = "--";
-                }
-            });
-        });
-    }
-
-    function saveSettings(){
-        const e = document.getElementById('enabled').checked;
-        const p = document.getElementById('port').value;
-        if(confirm("Save settings and reboot device?")) {
-            window.location.href=`/save_modbustcp?enabled=${e}&port=${p}`;
-        }
-        return false;
-    }
-
-    window.onload=function(){
-        document.getElementById('enabled').checked = )rawliteral" + String(modbusTcpEnabled ? "true" : "false") + R"rawliteral(;
-        document.getElementById('port').value = )rawliteral" + String(modbusTcpPort) + R"rawliteral(;
-        
-        generateLiveTable();
-        setInterval(updateLiveValues, 2000); // Poll every 2s
-        updateLiveValues();
-    };
-</script>
-</body>
-</html>
-)rawliteral";
-    server.send(200, "text/html", html);
-}
-
-void handleSaveModbusTcp() {
-    preferences.begin("modbustcp-cfg", false); 
-    bool enabled = (server.arg("enabled") == "true");
-    uint16_t port = server.arg("port").toInt();
-    preferences.putBool("enabled", enabled);
-    preferences.putUShort("port", port);
-    preferences.end();
-    server.send(200, "text/plain", "Settings saved. Rebooting now...");
+void handleReboot() {
+    server.send(200, "text/plain", "Rebooting...");
     delay(1000);
     ESP.restart();
+}
+
+void handleNotFound() {
+    server.send(404, "text/plain", "Not found");
+}
+
+void handleMqttStatus() {
+    DynamicJsonDocument doc(256);
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        doc["status"] = mqttStatus;
+        xSemaphoreGive(dataMutex);
+    } else {
+        doc["status"] = "Status unavailable (mutex locked)";
+    }
+    String payload;
+    serializeJson(doc, payload);
+    server.send(200, "application/json", payload);
 }
 
 void handleSetMetricsInterval() {
@@ -3217,30 +2778,58 @@ void handleClearSystemLog() {
     server.send(200, "text/plain", "System log cleared.");
 }
 
-// --- NEW: JSON Handler for Diagnostics ---
-void handleDeviceInfoJson() {
-    DynamicJsonDocument doc(4096);
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        doc["uptime"] = formatUptime(millis());
-        doc["ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-        doc["rssi"] = (WiFi.status() == WL_CONNECTED) ? String(WiFi.RSSI()) + " dBm" : "N/A";
-        doc["free_ram"] = ESP.getFreeHeap();
+void handleDeviceInfo() {
+    // 1. Check if JSON format is requested for dynamic updates
+    if (server.hasArg("format") && server.arg("format") == "json") {
+        DynamicJsonDocument doc(1024);
+        
+        bool internetConnected = (WiFi.status() == WL_CONNECTED);
+        String ipAddr = internetConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+        String rssiVal = internetConnected ? String(WiFi.RSSI()) + " dBm" : "N/A";
+        String statusText = internetConnected ? "Connected to Internet" : "No Internet (AP Mode)";
+        
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            doc["uptime"] = formatUptime(millis());
+            doc["ram"] = String(ESP.getFreeHeap()) + " bytes";
+            doc["log"] = globalLogBuffer;
+            xSemaphoreGive(dataMutex);
+        } else {
+            doc["uptime"] = "--";
+            doc["ram"] = "--";
+            doc["log"] = "Log busy...";
+        }
+        
         doc["time"] = getTimestamp();
-        doc["model"] = sensor_model;
-        doc["serial"] = sensor_serial;
-        doc["uuid"] = sensor_uuid; // NEW
-        doc["fw"] = sensor_fw_version;
-        doc["log"] = globalLogBuffer;
+        doc["ip"] = ipAddr;
+        doc["rssi"] = rssiVal;
+        doc["status"] = statusText;
+        doc["connected"] = internetConnected;
+
+        String payload;
+        serializeJson(doc, payload);
+        server.send(200, "application/json", payload);
+        return;
+    }
+
+    // 2. Otherwise serve the HTML page
+    String uptime = formatUptime(millis());
+    String localLog;
+    String d_model, d_serial, d_url, d_pn, d_fw;
+    
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        localLog = globalLogBuffer;
+        d_model = sensor_model;
+        d_serial = sensor_serial;
+        d_url = sensor_vendor_url; 
+        d_pn = sensor_part_number;
+        d_fw = sensor_fw_version;
         xSemaphoreGive(dataMutex);
     }
-    String json;
-    serializeJson(doc, json);
-    server.send(200, "application/json", json);
-}
+    localLog.replace("\n", "<br>");
 
-void handleDeviceInfo() {
-    // This handler now serves the static HTML shell.
-    // The JS inside fetches data from /device_info_json
+    bool internetConnected = (WiFi.status() == WL_CONNECTED);
+    String ipAddr = internetConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    String rssiVal = internetConnected ? String(WiFi.RSSI()) + " dBm" : "N/A";
 
     String html = R"rawliteral(
 <!DOCTYPE html><html><head><title>Device Diagnostics</title><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3262,72 +2851,94 @@ h2{color:#2c3e50;margin-top:0}.info-grid{display:grid;grid-template-columns:1fr 
 .status-disconnected { color: #e74c3c; font-weight: bold; }
 .nav-link{display:inline-block;margin-top:30px;color:#007bff;text-decoration:none;font-weight:600; border: 1px solid #007bff; padding: 10px 20px; border-radius: 6px; transition: all 0.2s; }
 .nav-link:hover { background-color: #007bff; color: white; }
-</style></head>
-<body>
-<div class="container">
-    <h2>Device Diagnostics</h2>
-    
-    <div class="info-grid">
-        <div class="info-item"><span class="info-label">Sensor Model</span><span class="info-value" id="d_model">Loading...</span></div>
-        <div class="info-item"><span class="info-label">Part Number (Serial)</span><span class="info-value" id="d_serial">Loading...</span></div>
-        <div class="info-item"><span class="info-label">Device UUID</span><span class="info-value" id="d_uuid">Loading...</span></div>
-        <div class="info-item"><span class="info-label">Sensor Firmware</span><span class="info-value" id="d_fw">Loading...</span></div>
-        
-        <div class="info-item full-width"><span class="info-label">Vendor URL</span><span class="info-value">)rawliteral" + sensor_vendor_url + R"rawliteral(</span></div>
 
-        <div class="info-item"><span class="info-label">Connection Status</span><span class="info-value" id="d_status">Checking...</span></div>
-        <div class="info-item"><span class="info-label">Last Reset Reason</span><span class="info-value" style="color:#d63031">)rawliteral" + lastResetReason + R"rawliteral(</span></div>
-        
-        <div class="info-item"><span class="info-label">IP Address</span><span class="info-value" id="d_ip">--</span></div>
-        <div class="info-item"><span class="info-label">Signal Strength (RSSI)</span><span class="info-value" id="d_rssi">--</span></div>
-        
-        <div class="info-item"><span class="info-label">System Time</span><span class="info-value" id="d_time">--</span></div>
-        <div class="info-item"><span class="info-label">System Uptime</span><span class="info-value" id="d_uptime">--</span></div>
-        
-        <div class="info-item"><span class="info-label">Free RAM</span><span class="info-value" id="d_ram">--</span></div>
-        <div class="info-item"><span class="info-label">Firmware Ver</span><span class="info-value">)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></div>
-    </div>
+/* OTA Section Styles */
+.ota-box { background: #eef2f5; border: 1px solid #dee2e6; border-radius: 8px; padding: 20px; margin-top: 25px; text-align: left; }
+.ota-title { font-weight: 600; color: #2c3e50; margin-bottom: 15px; display: flex; align-items: center; gap: 8px; }
+.file-upload-row { display: flex; gap: 10px; align-items: center; margin-bottom: 15px; }
+input[type=file] { background: white; padding: 8px; border-radius: 6px; border: 1px solid #ced4da; flex-grow: 1; }
+.btn-upload { background-color: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+.btn-upload:disabled { background-color: #6c757d; cursor: not-allowed; }
+.progress-container { width: 100%; background-color: #dfe6e9; border-radius: 10px; height: 20px; overflow: hidden; display: none; margin-bottom: 10px; }
+.progress-bar { width: 0%; height: 100%; background-color: #2ecc71; text-align: center; line-height: 20px; color: white; font-size: 12px; font-weight: bold; transition: width 0.3s; }
+#ota-status { font-size: 14px; font-weight: 500; min-height: 20px; }
+.status-error { color: #dc3545; }
+.status-success { color: #28a745; }
+.ota-drop-zone { border: 2px dashed #ced4da; border-radius: 8px; padding: 30px; text-align: center; color: #6c757d; cursor: pointer; transition: 0.3s; background: white; }
+.ota-drop-zone.active { border-color: #007bff; background-color: #f1f8ff; color: #007bff; }
+.ota-drop-zone p { margin: 10px 0 0; font-size: 14px; }
+</style></head><body><div class="container"><h2>Device Diagnostics</h2>
+<div class="info-grid">
 
-    <div class="log-box">
-        <div class="log-header">
-            <h3>System Event Log</h3>
-            <button class="btn-clear" onclick="clearLog()"><i data-lucide="trash-2" style="width:14px;"></i> Clear Log</button>
-        </div>
-        <div class="log-content" id="logContent">Loading log...</div>
-    </div>
+<div class="info-item"><span class="info-label">Sensor Model</span><span class="info-value">)rawliteral" + d_model + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Part Number</span><span class="info-value">)rawliteral" + d_pn + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Sensor Serial</span><span class="info-value">)rawliteral" + d_serial + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Vendor URL</span><span class="info-value">)rawliteral" + d_url + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Sensor Firmware</span><span class="info-value">)rawliteral" + d_fw + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Connection Status</span><span class="info-value" id="val-status">)rawliteral" + (internetConnected ? "Connected to Internet" : "No Internet (AP Mode)") + R"rawliteral(</span></div>
 
-    <a href="/settings" class="nav-link">&larr; Back to Settings</a>
+<div class="info-item"><span class="info-label">Last Reset Reason</span><span class="info-value" style="color:#d63031">)rawliteral" + lastResetReason + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">IP Address</span><span class="info-value" id="val-ip">)rawliteral" + ipAddr + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Signal Strength (RSSI)</span><span class="info-value" id="val-rssi">)rawliteral" + rssiVal + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">System Time</span><span class="info-value" id="val-time">)rawliteral" + getTimestamp() + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">System Uptime</span><span class="info-value" id="val-uptime">)rawliteral" + uptime + R"rawliteral(</span></div>
+<div class="info-item"><span class="info-label">Free RAM</span><span class="info-value" id="val-ram">)rawliteral" + String(ESP.getFreeHeap()) + R"rawliteral( bytes</span></div>
+<div class="info-item"><span class="info-label">Firmware</span><span class="info-value">)rawliteral" + String(FIRMWARE_VERSION) + R"rawliteral(</span></div>
 </div>
 
-<script>
-lucide.createIcons();
+<div class="ota-box">
+    <div class="ota-title"><i data-lucide="upload-cloud"></i> Firmware Update (OTA)</div>
+    <div class="ota-drop-zone" id="dropZone" onclick="document.getElementById('otafile').click()">
+        <i data-lucide="file-up" style="width: 32px; height: 32px;"></i>
+        <p>Click or Drag & Drop <strong>.bin</strong> firmware file here</p>
+        <div id="fileName" style="margin-top: 10px; font-weight: bold; color: #333; display:none;"></div>
+    </div>
+    <input type="file" id="otafile" name="update" accept=".bin" style="display:none" onchange="fileSelected(this)">
+    <button class="btn-upload" onclick="performOTA()" id="uploadBtn" style="width:100%; margin-top: 15px;" disabled>Start Update</button>
+    <div class="progress-container" id="progressWrap">
+        <div class="progress-bar" id="progressBar">0%</div>
+    </div>
+    <div id="ota-status"></div>
+</div>
 
-function fetchDiagnostics() {
-    fetch('/device_info_json')
+<div class="log-box">
+  <div class="log-header">
+    <h3>System Event Log</h3>
+    <button class="btn-clear" onclick="clearLog()"><i data-lucide="trash-2" style="width:14px;"></i> Clear Log</button>
+  </div>
+  <div class="log-content" id="logContent">)rawliteral" + localLog + R"rawliteral(</div>
+</div>
+<a href="/settings" class="nav-link">&larr; Back to Settings</a></div>
+<script>
+if (typeof lucide !== 'undefined') { lucide.createIcons(); }
+
+// --- Live Update Logic ---
+setInterval(updateDiagnostics, 2000);
+
+function updateDiagnostics() {
+    fetch('/device_info?format=json')
         .then(response => response.json())
         .then(data => {
-            document.getElementById('d_model').textContent = data.model;
-            document.getElementById('d_serial').textContent = data.serial;
-            document.getElementById('d_uuid').textContent = data.uuid;
-            document.getElementById('d_fw').textContent = data.fw;
-            document.getElementById('d_ip').textContent = data.ip;
-            document.getElementById('d_rssi').textContent = data.rssi;
-            document.getElementById('d_time').textContent = data.time;
-            document.getElementById('d_uptime').textContent = data.uptime;
-            document.getElementById('d_ram').textContent = data.free_ram + " bytes";
-            document.getElementById('logContent').innerHTML = data.log.replace(/\n/g, "<br>");
+            document.getElementById('val-uptime').textContent = data.uptime;
+            document.getElementById('val-ram').textContent = data.ram;
+            document.getElementById('val-time').textContent = data.time;
+            document.getElementById('val-ip').textContent = data.ip;
+            document.getElementById('val-rssi').textContent = data.rssi;
             
-            // Connection Status logic
-            const statusEl = document.getElementById('d_status');
-            if (data.ip.startsWith("192.168.4")) {
-                statusEl.textContent = "AP Mode Active (No Internet)";
-                statusEl.className = "info-value status-disconnected";
+            const statusEl = document.getElementById('val-status');
+            statusEl.textContent = data.status;
+            if(data.connected) {
+                statusEl.classList.remove('status-disconnected');
+                statusEl.classList.add('status-connected');
             } else {
-                statusEl.textContent = "Connected to WiFi";
-                statusEl.className = "info-value status-connected";
+                statusEl.classList.remove('status-connected');
+                statusEl.classList.add('status-disconnected');
             }
+            
+            // Optional: Update Log if you want real-time logs
+            // document.getElementById('logContent').innerHTML = data.log.replace(/\n/g, '<br>');
         })
-        .catch(err => console.error("Diag Fetch Error:", err));
+        .catch(err => console.error('Error fetching diagnostics:', err));
 }
 
 function clearLog() {
@@ -3338,33 +2949,375 @@ function clearLog() {
     }
 }
 
-// Initial fetch and periodic update
-fetchDiagnostics();
-setInterval(fetchDiagnostics, 2000); // Update every 2 seconds
+// --- Drag & Drop Logic ---
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('otafile');
+
+['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+  dropZone.addEventListener(eventName, preventDefaults, false);
+});
+function preventDefaults(e) { e.preventDefault(); e.stopPropagation(); }
+
+['dragenter', 'dragover'].forEach(eventName => {
+  dropZone.addEventListener(eventName, () => dropZone.classList.add('active'), false);
+});
+['dragleave', 'drop'].forEach(eventName => {
+  dropZone.addEventListener(eventName, () => dropZone.classList.remove('active'), false);
+});
+
+dropZone.addEventListener('drop', handleDrop, false);
+
+function handleDrop(e) {
+  const dt = e.dataTransfer;
+  const files = dt.files;
+  if(files.length > 0) {
+      fileInput.files = files;
+      fileSelected(fileInput);
+  }
+}
+
+function fileSelected(input) {
+    const file = input.files[0];
+    if (file) {
+        if (!file.name.endsWith(".bin")) {
+            alert("Invalid file type! Please select a .bin firmware file.");
+            input.value = ""; // Clear
+            document.getElementById('fileName').style.display = 'none';
+            document.getElementById('uploadBtn').disabled = true;
+            return;
+        }
+        document.getElementById('fileName').textContent = file.name + " (" + (file.size/1024/1024).toFixed(2) + " MB)";
+        document.getElementById('fileName').style.display = 'block';
+        document.getElementById('uploadBtn').disabled = false;
+        document.getElementById('ota-status').innerHTML = '';
+    }
+}
+
+function performOTA() {
+    var file = fileInput.files[0];
+    if (!file) return;
+
+    if(!confirm("Start firmware update? Do not power off the device.")) return;
+
+    var status = document.getElementById('ota-status');
+    var btn = document.getElementById('uploadBtn');
+    var progressBar = document.getElementById('progressBar');
+    var progressWrap = document.getElementById('progressWrap');
+    
+    // Warn user before leaving page
+    window.onbeforeunload = function() { return "Update in progress. Are you sure?"; };
+
+    var formData = new FormData();
+    formData.append("update", file);
+    var xhr = new XMLHttpRequest();
+    
+    // UI Reset
+    btn.disabled = true;
+    btn.textContent = "Uploading...";
+    status.innerHTML = '<span style="color:#007bff">Starting upload...</span>';
+    progressWrap.style.display = 'block';
+    progressBar.style.width = '0%';
+    progressBar.innerHTML = '0%';
+
+    // Progress Handler
+    xhr.upload.addEventListener("progress", function(e) {
+        if (e.lengthComputable) {
+            var percent = Math.round((e.loaded / e.total) * 100);
+            var loadedMB = (e.loaded / 1024 / 1024).toFixed(2);
+            var totalMB = (e.total / 1024 / 1024).toFixed(2);
+            
+            progressBar.style.width = percent + '%';
+            progressBar.innerHTML = percent + '%';
+            status.innerHTML = `Uploading: ${loadedMB} MB / ${totalMB} MB`;
+            
+            if(percent === 100) status.innerHTML = '<span style="color:#28a745">Finalizing update... please wait.</span>';
+        }
+    }, false);
+
+    // Completion Handler
+    xhr.onload = function() {
+        window.onbeforeunload = null; // Remove warning
+        if (xhr.status === 200) {
+            status.innerHTML = '<span class="status-success">Update Success! Rebooting...</span>';
+            progressBar.style.backgroundColor = '#2ecc71';
+            setTimeout(function() { window.location.href = '/'; }, 10000);
+        } else {
+            status.innerHTML = '<span class="status-error">Update Failed! Server Error.</span>';
+            btn.disabled = false;
+            btn.textContent = "Retry Upload";
+        }
+    };
+
+    // Error Handler
+    xhr.onerror = function() {
+        window.onbeforeunload = null;
+        status.innerHTML = '<span class="status-error">Update Failed! Network Error.</span>';
+        btn.disabled = false;
+        btn.textContent = "Retry Upload";
+    };
+
+    xhr.open("POST", "/update");
+    xhr.send(formData);
+}
 </script>
 </body></html>)rawliteral";
     server.send(200, "text/html", html);
 }
 
-void handleReboot() {
-    server.send(200, "text/plain", "Rebooting...");
+void handleModbusTcpSettings() {
+    String ipAddress = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Modbus TCP Server</title>
+    <style>
+        :root { --primary: #0056b3; --secondary: #6c757d; --bg: #f8f9fa; --border: #dee2e6; --green: #28a745; --red: #dc3545; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: #333; margin: 0; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
+        h1 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid var(--border); padding-bottom: 15px; display: flex; justify-content: space-between; align-items: center; }
+        .config-box { background: #e9ecef; padding: 20px; border-radius: 8px; margin-bottom: 30px; border-left: 5px solid var(--primary); }
+        .form-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
+        .info-row { display: flex; gap: 20px; margin-bottom: 20px; font-family: monospace; font-size: 1.1em; background: #fff; padding: 10px; border-radius: 6px; }
+        label { font-weight: 600; color: #495057; }
+        input[type=number] { padding: 8px; border-radius: 4px; border: 1px solid #ced4da; width: 80px; }
+        button { background: var(--primary); color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #004494; }
+        
+        /* Toggle Switch */
+        .switch { position: relative; display: inline-block; width: 50px; height: 26px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: var(--green); }
+        input:checked + .slider:before { transform: translateX(24px); }
+
+        /* Tables */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.9em; margin-bottom: 30px; }
+        th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+        th { background-color: #f1f3f5; font-weight: 700; position: sticky; top: 0; }
+        
+        .addr-badge { background: #495057; color: white; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
+        .live-val { font-family: monospace; font-weight: bold; color: var(--primary); }
+        .section-header { background-color: #343a40; color: white; padding: 10px; font-size: 1.1em; border-radius: 6px 6px 0 0; margin-bottom: 0; }
+        .section-desc { font-size: 0.9em; color: #666; margin-bottom: 10px; padding: 0 5px; }
+        
+        .badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.8em; font-weight: bold; }
+        .bg-green { background-color: var(--green); }
+        .bg-blue { background-color: #17a2b8; }
+        .axis-header { background-color: #e2e6ea; font-weight: bold; text-align: center; }
+        .source-map { font-size: 0.85em; color: #555; margin-top: 5px; line-height: 1.4; border-top: 1px dashed #ccc; padding-top: 4px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Modbus TCP Server</h1>
+    
+    <div class="config-box">
+        <div class="info-row">
+            <span><strong>IP Address:</strong> <span style="color:var(--primary)">)rawliteral" + ipAddress + R"rawliteral(</span></span>
+            <span><strong>Status:</strong> <span id="server-status" style="font-weight:bold;">)rawliteral" + String(modbusTcpEnabled ? "RUNNING" : "STOPPED") + R"rawliteral(</span></span>
+            <span><strong>Slave ID:</strong> 1</span>
+        </div>
+        
+        <form onsubmit="return saveSettings()">
+            <div class="form-row">
+                <label for="enabled">Enable Server</label>
+                <label class="switch"><input type="checkbox" id="enabled" name="enabled"><span class="slider"></span></label>
+            </div>
+            <div class="form-row">
+                <label for="port">Port (Default: 502)</label>
+                <input type="number" id="port" name="port" min="1" max="65535" required>
+            </div>
+            <button type="submit">Save Configuration & Reboot</button>
+        </form>
+    </div>
+
+    <div class="section-header">Live Metrics Map (Read Only)</div>
+    <p class="section-desc">Registers 0-60 update in real-time based on sensor polling.</p>
+    <table>
+        <thead><tr><th>Address</th><th>Metric Name</th><th>Unit</th><th>Live Value</th></tr></thead>
+        <tbody id="live-table-body"></tbody>
+    </table>
+
+    <div class="section-header">Section 1: Control & Status (Read/Write)</div>
+    <p class="section-desc">Trigger captures and check status.</p>
+    <table>
+        <thead><tr><th>Addr</th><th>Name</th><th>R/W</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr>
+                <td><span class="addr-badge">90</span></td>
+                <td>Waveform Status</td>
+                <td>R</td>
+                <td>0=Busy, 2=X Ready, 3=Y Ready, 4=Z Ready</td>
+            </tr>
+            <tr>
+                <td><span class="addr-badge">91</span></td>
+                <td>Spectrum Status</td>
+                <td>R</td>
+                <td>0=Busy, 2=X Ready, 3=Y Ready, 4=Z Ready</td>
+            </tr>
+            <tr>
+                <td><span class="addr-badge">92</span></td>
+                <td>Trigger Waveform</td>
+                <td>W</td>
+                <td>Write: 1=All(XYZ), 2=X Only, 3=Y Only, 4=Z Only</td>
+            </tr>
+            <tr>
+                <td><span class="addr-badge">93</span></td>
+                <td>Trigger Spectrum</td>
+                <td>W</td>
+                <td>Write: 1=All(XYZ), 2=X Only, 3=Y Only, 4=Z Only</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="section-header">Section 2: Time Waveform Data (Read Only)</div>
+    <p class="section-desc"><strong>Range:</strong> 1000 to 14333. <strong>Type:</strong> Signed Int16 (x 0.001 g). Data updates when Status (90) changes.</p>
+    <table>
+        <thead><tr><th>Block #</th><th>Start</th><th>End</th><th>Length</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr><td>1</td><td><span class="addr-badge">1000</span></td><td>1099</td><td>100</td><td>Points 1 - 100</td></tr>
+            <tr><td>2</td><td><span class="addr-badge">1100</span></td><td>1199</td><td>100</td><td>Points 101 - 200</td></tr>
+            <tr><td>...</td><td>...</td><td>...</td><td>...</td><td>...</td></tr>
+            <tr><td>134</td><td><span class="addr-badge">14300</span></td><td>14333</td><td>34</td><td>Points 13301 - 13334</td></tr>
+        </tbody>
+    </table>
+
+    <div class="section-header">Section 3: FFT Spectrum Data (Read Only)</div>
+    <p class="section-desc"><strong>Range:</strong> 20000 to 26144. <strong>Type:</strong> Unsigned Int16 (x 0.001 g). Data updates when Status (91) changes.</p>
+    <table>
+        <thead><tr><th>Block #</th><th>Start</th><th>End</th><th>Length</th><th>Description</th></tr></thead>
+        <tbody>
+            <tr><td>1</td><td><span class="addr-badge">20000</span></td><td>20099</td><td>100</td><td>Points 1 - 100</td></tr>
+            <tr><td>2</td><td><span class="addr-badge">20100</span></td><td>20199</td><td>100</td><td>Points 101 - 200</td></tr>
+            <tr><td>...</td><td>...</td><td>...</td><td>...</td><td>...</td></tr>
+            <tr><td>62</td><td><span class="addr-badge">26100</span></td><td>26144</td><td>45</td><td>Points 6101 - 6145</td></tr>
+        </tbody>
+    </table>
+
+    <div class="config-box" style="border-left-color: #28a745;">
+        <h3>Example Usage (PLC / Node-RED)</h3>
+        <p><strong>Scenario: Manual X-Axis Capture</strong></p>
+        <ol>
+            <li><strong>Write:</strong> Value <code>2</code> to Address <code>92</code> (Trigger Waveform).</li>
+            <li><strong>Poll:</strong> Read Address <code>90</code>. Wait until it becomes <code>2</code> (Ready).</li>
+            <li><strong>Read:</strong> Read Address <code>1000</code> (Length 100...) to get data.</li>
+        </ol>
+    </div>
+
+    <div style="margin-top:30px; text-align:center;">
+        <a href="/settings" style="display:inline-block; padding:10px 20px; background:#6c757d; color:white; text-decoration:none; border-radius:6px; font-weight:600;">&larr; Back to Settings</a>
+    </div>
+</div>
+
+<script>
+    const liveRegisters=[
+        // X-Axis
+        {addr:0,name:"X Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"x"}, 
+        {addr:1,name:"X Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"x"},
+        {addr:2,name:"X Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"x"}, 
+        {addr:3,name:"X Accel Peak (10-5k)",unit:"g",key:"accelPeak2",axis:"x"},
+        {addr:4,name:"X Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"x"}, 
+        {addr:5,name:"X Vel Peak (10-1k)",unit:"mm/s",key:"veloPeak",axis:"x"},
+        {addr:6,name:"X Disp RMS (10-1k)",unit:"um",key:"displRms",axis:"x"}, 
+        {addr:7,name:"X Disp Peak (10-1k)",unit:"um",key:"displPeak",axis:"x"},
+        {addr:8,name:"X True Peak",unit:"g",key:"truePeak",axis:"x"}, 
+        {addr:9,name:"X Crest Factor",unit:"-",key:"crestFactor",axis:"x"},
+        {addr:10,name:"X Accel Metric RMS",unit:"m/s²",key:"accelMetricRms",axis:"x"},
+        {addr:14,name:"X Vel Wide RMS",unit:"mm/s",key:"veloWideRms",axis:"x"},
+        {addr:16,name:"X Disp Low RMS",unit:"um",key:"displLowRms",axis:"x"},
+
+        // Y-Axis
+        {addr:20,name:"Y Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"y"}, 
+        {addr:21,name:"Y Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"y"},
+        {addr:22,name:"Y Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"y"},
+        {addr:24,name:"Y Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"y"},
+        {addr:28,name:"Y True Peak",unit:"g",key:"truePeak",axis:"y"},
+        {addr:29,name:"Y Crest Factor",unit:"-",key:"crestFactor",axis:"y"},
+
+        // Z-Axis
+        {addr:40,name:"Z Accel RMS (2-1k)",unit:"g",key:"accelRms",axis:"z"}, 
+        {addr:41,name:"Z Accel Peak (2-1k)",unit:"g",key:"accelPeak",axis:"z"},
+        {addr:42,name:"Z Accel RMS (10-5k)",unit:"g",key:"accelRms2",axis:"z"},
+        {addr:44,name:"Z Vel RMS (10-1k)",unit:"mm/s",key:"veloRms",axis:"z"},
+        {addr:48,name:"Z True Peak",unit:"g",key:"truePeak",axis:"z"},
+        {addr:49,name:"Z Crest Factor",unit:"-",key:"crestFactor",axis:"z"},
+        
+        // System
+        {addr:60,name:"Temperature",unit:"C",key:"temperature",axis:null},
+        {addr:90,name:"Waveform Ready",unit:"Bool",key:"newWaveformAvailable",axis:null},
+        {addr:91,name:"Spectrum Ready",unit:"Bool",key:"newSpectrumAvailable",axis:null}
+    ];
+
+    function generateLiveTable(){
+        let h=''; 
+        liveRegisters.forEach(r=>{
+            let id = `val-${r.key}${r.axis ? '-'+r.axis : ''}`;
+            // Add spacing rows for visual separation of axes
+            if(r.addr === 20) h += '<tr class="axis-header"><td colspan="4">Y-AXIS</td></tr>';
+            if(r.addr === 40) h += '<tr class="axis-header"><td colspan="4">Z-AXIS</td></tr>';
+            if(r.addr === 60) h += '<tr class="axis-header"><td colspan="4">SYSTEM</td></tr>';
+            
+            h+=`<tr>
+                <td><span class="addr-badge">${r.addr}</span></td>
+                <td>${r.name}</td>
+                <td>${r.unit}</td>
+                <td class="live-val" id="${id}">--</td>
+            </tr>`
+        });
+        document.getElementById('live-table-body').innerHTML=h;
+    }
+
+    function updateLiveValues(){
+        fetch('/data').then(r=>r.json()).then(d=>{
+            liveRegisters.forEach(r=>{
+                let v = (r.axis) ? d[r.key][r.axis] : d[r.key];
+                let el = document.getElementById(`val-${r.key}${r.axis ? '-'+r.axis : ''}`);
+                if(el) {
+                    if(typeof v === 'boolean') el.textContent = v ? "1 (YES)" : "0 (NO)";
+                    else if(typeof v === 'number') el.textContent = v.toFixed(3);
+                    else el.textContent = "--";
+                }
+            });
+        });
+    }
+
+    function saveSettings(){
+        const e = document.getElementById('enabled').checked;
+        const p = document.getElementById('port').value;
+        if(confirm("Save settings and reboot device?")) {
+            window.location.href=`/save_modbustcp?enabled=${e}&port=${p}`;
+        }
+        return false;
+    }
+
+    window.onload=function(){
+        document.getElementById('enabled').checked = )rawliteral" + String(modbusTcpEnabled ? "true" : "false") + R"rawliteral(;
+        document.getElementById('port').value = )rawliteral" + String(modbusTcpPort) + R"rawliteral(;
+        
+        generateLiveTable();
+        setInterval(updateLiveValues, 2000); // Poll every 2s
+        updateLiveValues();
+    };
+</script>
+</body>
+</html>
+)rawliteral";
+    server.send(200, "text/html", html);
+}
+
+void handleSaveModbusTcp() {
+    preferences.begin("modbustcp-cfg", false); 
+    bool enabled = (server.arg("enabled") == "true");
+    uint16_t port = server.arg("port").toInt();
+    preferences.putBool("enabled", enabled);
+    preferences.putUShort("port", port);
+    preferences.end();
+    server.send(200, "text/plain", "Settings saved. Rebooting now...");
     delay(1000);
     ESP.restart();
-}
-
-void handleNotFound() {
-    server.send(404, "text/plain", "Not found");
-}
-
-void handleMqttStatus() {
-    DynamicJsonDocument doc(256);
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        doc["status"] = mqttStatus;
-        xSemaphoreGive(dataMutex);
-    } else {
-        doc["status"] = "Status unavailable (mutex locked)";
-    }
-    String payload;
-    serializeJson(doc, payload);
-    server.send(200, "application/json", payload);
 }
